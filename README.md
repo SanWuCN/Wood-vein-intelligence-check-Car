@@ -95,8 +95,10 @@ RViz 跑在**独立 Xvfb 显示**（`rviz_display`，默认 `:99`），屏幕尺
 2. Xvfb 以 `-nocursor` 启动，鼠标指针不会被烙进推流。
 3. `deploy/console.rviz` 是唯一权威配置，每次启动复制成 `runtime/rviz/console.rviz` 再交给 RViz，避免 RViz 退出回写污染。
 4. 后台按 `video_fps` 抓屏编码 JPEG，前端用 `contain` 等比显示，地图面板比例与推流比例一致，因此既不变形也没有黑边。
-5. 待命时底盘不发布 `map` 帧，所以固定坐标系取 `odom_combined`；视角目标帧 `console_view` 由 `ros_bridge` 依据里程计发布
-   （只平移、不旋转），小车始终居中且地图朝上。
+5. 固定坐标系用 `map`（地图自身帧）：`/map` 的显示因此不依赖坐标变换，否则 RViz 的 tf 过滤器会以
+   “消息时间早于 TF 缓存”为由把只发一次的锁存地图丢掉。Map 显示的持久性用 Transient Local，RViz 后启动也能收到。
+6. 待命时底盘不发布任何 `map→*` 变换，`ros_bridge` 会补发恒等 `map→odom_combined`（建图/巡航由 gmapping/AMCL 接管），
+   待命与巡航都有网格可看；视角目标帧 `console_view` 由 `ros_bridge` 依据里程计发布（只平移、不旋转），小车始终居中且地图朝上。
 
 ## 接口
 
