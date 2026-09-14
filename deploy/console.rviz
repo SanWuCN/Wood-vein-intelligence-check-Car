@@ -146,7 +146,7 @@ Visualization Manager:
     Topic:
       Value: /map
       Depth: 1
-      Durability Policy: Volatile
+      Durability Policy: Transient Local
       History Policy: Keep Last
       Reliability Policy: Reliable
     Update Topic:
@@ -163,7 +163,7 @@ Visualization Manager:
     Topic:
       Value: /plan
       Reliability Policy: Reliable
-      Durability Policy: Volatile
+      Durability Policy: Transient Local
       Depth: 5
     Color: 61; 157; 255
     Line Style: Lines
@@ -171,7 +171,7 @@ Visualization Manager:
   Enabled: true
   Global Options:
     Background Color: 13; 23; 40
-    Fixed Frame: odom_combined
+    Fixed Frame: map
     Frame Rate: 8
   Name: root
   Tools: []

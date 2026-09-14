@@ -172,10 +172,18 @@ class RosBridge(Node):
 
     def publish_view_frame(self):
         if not self.view_broadcaster:return
-        with self.lock:odom=self.odom;frame=self.odom_frame
+        with self.lock:odom=self.odom;frame=self.odom_frame;mode=self.mode
         if not odom:return
         try:
-            t=TransformStamped();t.header.stamp=self.get_clock().now().to_msg()
+            now=self.get_clock().now().to_msg()
+            if mode=='idle':
+                # 待命时底盘不发布任何 map→* 变换，RViz 固定坐标系取 map 会无帧可用；
+                # 这里补一个恒等变换，建图/巡航时由 gmapping/AMCL 接管，本函数不再发。
+                anchor=TransformStamped();anchor.header.stamp=now
+                anchor.header.frame_id='map';anchor.child_frame_id=frame
+                anchor.transform.rotation.w=1.0
+                self.view_broadcaster.sendTransform(anchor)
+            t=TransformStamped();t.header.stamp=now
             t.header.frame_id=frame;t.child_frame_id='console_view'
             t.transform.translation.x=float(odom['pose']['x']);t.transform.translation.y=float(odom['pose']['y']);t.transform.translation.z=0.0
             t.transform.rotation.w=1.0
