@@ -1,0 +1,20 @@
+[Unit]
+Description=Mumai Robot Console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wheeltec
+WorkingDirectory=/home/wheeltec/mumai-console
+Environment=HOME=/home/wheeltec
+Environment=PYTHONUNBUFFERED=1
+Environment=ROS_LOCALHOST_ONLY=0
+ExecStart=/bin/bash /home/wheeltec/mumai-console/deploy/run.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

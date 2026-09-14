@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=木脉智检
+Comment=Robot console
+Exec=/bin/bash /home/wheeltec/mumai-console/deploy/kiosk.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true
+StartupNotify=false

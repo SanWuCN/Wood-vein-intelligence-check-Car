@@ -1,0 +1,29 @@
+{
+  "device_id": "mumai-car-01",
+  "host": "0.0.0.0",
+  "port": 8765,
+  "workspace": "/home/wheeltec/wheeltec_ros2",
+  "camera_topic": "/camera/color/image_raw",
+  "camera_auto_start": true,
+  "rviz_display": ":99",
+  "rviz_size": [
+    694,
+    434
+  ],
+  "video_fps": 8,
+  "max_speed_mps": 0.35,
+  "default_speed_mps": 0.2,
+  "platform_url": "",
+  "platform_token": "",
+  "rviz_rtmp_url": "",
+  "camera_rtmp_url": "",
+  "telemetry_interval_s": 1,
+  "control_token": "",
+  "rviz_chrome": {
+    "left": 25,
+    "top": 71,
+    "right": 25,
+    "bottom": 39
+  },
+  "rviz_follow": true
+}

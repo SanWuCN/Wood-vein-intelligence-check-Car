@@ -1,0 +1,6 @@
+aiohttp>=3.8,<4
+numpy>=1.21,<2
+Pillow>=9
+psutil>=5.9
+PyYAML>=6
+# rclpy, cv_bridge and ROS message packages come from ROS 2 Humble.
