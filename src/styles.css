@@ -92,6 +92,9 @@ svg{flex-shrink:0}
 .map-zoom{display:flex;flex-direction:column;position:absolute;right:10px;bottom:12px;box-shadow:0 4px 12px #0003;border-radius:5px;overflow:hidden}
 .map-zoom button{width:28px;height:27px;border-radius:0;padding:3px;border-color:#38506a;background:#102338}
 .map-zoom button svg{width:15px}
+.map-nudge{position:absolute;right:44px;bottom:12px;z-index:2;display:grid;grid-template-columns:repeat(3,26px);grid-auto-rows:24px;gap:2px;padding:3px;background:#0b1626d0;border:1px solid #2b3d55;border-radius:5px}
+.map-nudge button{width:26px;height:24px;min-height:0;padding:0;border:0;background:transparent;color:#a9bdd4;border-radius:3px}
+.map-nudge button:hover:not(:disabled){background:#1b304a;color:#dceaff}
 .map-scale{position:absolute;bottom:14px;left:12px;display:flex;flex-direction:column;gap:4px;font-size:10px;color:#fff;text-shadow:0 1px 2px #456;font-family:ui-monospace,monospace}
 .map-scale i{display:block;border:1px solid #fff;border-top:0;height:5px;min-width:10px}
 .map-mode{position:absolute;left:8px;top:8px;display:flex;gap:6px;align-items:center;background:#102238df;color:#ffcf66;font-size:11px;padding:4px 8px;border-radius:4px;pointer-events:none}

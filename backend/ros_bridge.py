@@ -23,7 +23,7 @@ from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 from cv_bridge import CvBridge
 import cv2
-from core import ConsoleError, bounds, map_image, world_to_cell, validate_waypoints
+from core import ConsoleError, bounds, grid_likelihood, map_image, world_to_cell, snap_pose as core_snap_pose
 
 
 def yaw(q):
@@ -55,6 +55,7 @@ class RosBridge(Node):
         self.camera_jpeg=None;self.camera_at=0;self.camera_times=deque(maxlen=60);self.battery_voltage=None;self.voltage_at=0;self.bms=None;self.bms_at=0;self.charging=None;self.charging_at=0;self.charging_current=None;self.current_at=0;self.raw_odom=None;self.raw_odom_at=0;self.commanded=None;self.commanded_at=0;self.camera_size=None
         self.error=None;self.epoch=0;self.goal_handle=None;self.pending_goal=None;self.cancel_lock=asyncio.Lock();self.mission={'state':'idle','index':0,'cycle':0,'points':[],'mode':'multi','distance_remaining':None}
         self.speed=config['default_speed_mps'];self.cv=CvBridge();self._camera_encode_at=0
+        self._like=None;self._like_rev=None
         self.buffer=Buffer();self.listener=TransformListener(self.buffer,self)
         # RViz 俯视视角跟随小车：发布一个只有平移、不旋转的辅助坐标系，地图始终朝上。
         self.view_broadcaster=TransformBroadcaster(self) if config.get('rviz_follow',True) else None
@@ -233,6 +234,44 @@ class RosBridge(Node):
         msg=PoseStamped();msg.header.frame_id='map';msg.header.stamp=self.get_clock().now().to_msg()
         msg.pose.position.x=p['x'];msg.pose.position.y=p['y'];msg.pose.orientation.z=math.sin(p['yaw']/2);msg.pose.orientation.w=math.cos(p['yaw']/2)
         return msg
+
+    # ---- 人工定位吸附微调 -------------------------------------------------
+    def _likelihood(self):
+        """按地图版本缓存似然表：离障碍物越近分数越高。"""
+        with self.lock:grid=self.grid;rev=self.map_revision
+        if grid is None:return None
+        if self._like is not None and self._like_rev==rev:return self._like
+        self._like=grid_likelihood(grid,self.map_meta['resolution']);self._like_rev=rev
+        return self._like
+
+    def _scan_in_base(self,max_points=240):
+        """最近一帧雷达在 base_footprint 下的点，用于给候选位姿打分。"""
+        with self.lock:scan,scan_at=self.last_scan,self.scan_at
+        if scan is None or time.time()-scan_at>1.0:return None
+        try:
+            tf=self.buffer.lookup_transform('base_footprint',scan.header.frame_id,Time.from_msg(scan.header.stamp),timeout=Duration(seconds=.06))
+        except Exception:return None
+        a=yaw(tf.transform.rotation);t=tf.transform.translation
+        step=max(1,len(scan.ranges)//max_points);pts=[]
+        for i in range(0,len(scan.ranges),step):
+            r=scan.ranges[i]
+            if not math.isfinite(r) or not scan.range_min<=r<=scan.range_max:continue
+            ang=scan.angle_min+i*scan.angle_increment
+            pts.append((r*math.cos(ang),r*math.sin(ang)))
+        if len(pts)<24:return None
+        arr=np.asarray(pts,dtype=np.float32)
+        ca,sa=math.cos(a),math.sin(a)
+        return np.stack((arr[:,0]*ca-arr[:,1]*sa+t.x,arr[:,0]*sa+arr[:,1]*ca+t.y),axis=1)
+
+    def snap_pose(self,p):
+        """人工定位吸附：先移出障碍/未知区，再按雷达与地图的吻合度做小范围微调。"""
+        with self.lock:grid=self.grid;meta=self.map_meta
+        pts=self._scan_in_base() if (grid is not None and self.mode=='navigation') else None
+        like=self._likelihood() if pts is not None else None
+        pose={k:float(p[k]) for k in ('x','y','yaw')}
+        if self.mode!='navigation' or grid is None or meta is None:
+            return {'applied':False,'free_shift_m':0.0,'shift_m':0.0,'shift_deg':0.0,'score':None,'samples':0,'reason':'no_map','pose':pose}
+        return core_snap_pose(meta,grid,pts,pose,like=like)
 
     def localize(self,p):
         if self.mode!='navigation':raise ConsoleError('NOT_NAVIGATING','请先加载巡航地图')

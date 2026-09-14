@@ -1,4 +1,6 @@
 export type Pose={x:number;y:number;yaw:number};
+/* 人工定位吸附结果：先移出障碍，再按雷达-地图吻合度微调 */
+export type SnapInfo={applied:boolean;free_shift_m:number;shift_m:number;shift_deg:number;score:number|null;base_score?:number;samples?:number;reason?:string|null;pose?:Pose};
 export type MapMeta={width:number;height:number;resolution:number;origin:Pose;bounds:number[];frame_id:string;revision:number};
 export type SavedMap={id:string;name:string;created_at:string;map:MapMeta;area_m2:number;saved_pose:Pose|null};
 export type Route={id:string;name:string;map_id:string;mode:MissionMode;points:Pose[];speed_mps:number};

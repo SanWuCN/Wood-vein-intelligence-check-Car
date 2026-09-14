@@ -123,3 +123,109 @@ class MapStore:
     def load(self, map_id):
         p=self.directory(map_id)
         return json.loads((p/'metadata.json').read_text()), np.load(p/'grid.npy',allow_pickle=False)
+
+
+# ---- 人工定位吸附：与 ROS 无关的纯几何/打分实现，便于离线测试 ----------------
+def grid_likelihood(grid, resolution, radius=5, sigma=.12):
+    """离障碍物越近分数越高：障碍格 1.0，向外逐格按高斯衰减，用于位姿打分。"""
+    occ = grid > 20
+    like = np.zeros(grid.shape, dtype=np.float32)
+    like[occ] = 1.0
+    cur = occ.copy()
+    for r in range(1, radius + 1):
+        nxt = np.zeros_like(cur)
+        nxt[1:, :] |= cur[:-1, :]; nxt[:-1, :] |= cur[1:, :]
+        nxt[:, 1:] |= cur[:, :-1]; nxt[:, :-1] |= cur[:, 1:]
+        nxt[1:, 1:] |= cur[:-1, :-1]; nxt[1:, :-1] |= cur[:-1, 1:]
+        nxt[:-1, 1:] |= cur[1:, :-1]; nxt[:-1, :-1] |= cur[1:, 1:]
+        cur = nxt & (like == 0)
+        like[cur] = float(math.exp(-((r * resolution) ** 2) / (2 * sigma ** 2)))
+    return like
+
+
+def world_to_cells(meta, xs, ys):
+    """world_to_cell 的向量化版本，返回 (col,row) 整数数组。"""
+    o = meta['origin']; a = o['yaw']; dx = xs - o['x']; dy = ys - o['y']
+    ca, sa = math.cos(a), math.sin(a); res = meta['resolution']
+    return np.floor((ca * dx + sa * dy) / res).astype(np.int32), np.floor((-sa * dx + ca * dy) / res).astype(np.int32)
+
+
+def pose_score(like, meta, points, x, y, theta, min_points=12):
+    """把 base 系下的雷达点按候选位姿投到地图上，返回平均似然（0–1）。"""
+    ca, sa = math.cos(theta), math.sin(theta)
+    col, row = world_to_cells(meta, points[:, 0] * ca - points[:, 1] * sa + x, points[:, 0] * sa + points[:, 1] * ca + y)
+    h, w = like.shape
+    ok = (col >= 0) & (col < w) & (row >= 0) & (row < h)
+    if int(ok.sum()) < min_points: return 0.0
+    return float(like[row[ok], col[ok]].mean())
+
+
+def nearest_free(meta, grid, x, y, max_cells=60):
+    """点选落在障碍或未知区域时，向外螺旋找到最近可通行栅格中心 (距离, x, y)。"""
+    width, height = meta['width'], meta['height']
+    cx, cy = world_to_cell(meta, x, y)
+    if 0 <= cx < width and 0 <= cy < height and 0 <= int(grid[cy, cx]) <= 20: return None
+    for r in range(1, max_cells + 1):
+        best = None
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if max(abs(dx), abs(dy)) != r: continue
+                nx, ny = cx + dx, cy + dy
+                if not (0 <= nx < width and 0 <= ny < height): continue
+                if not 0 <= int(grid[ny, nx]) <= 20: continue
+                wx, wy = cell_to_world(meta, nx + .5, ny + .5)
+                d = math.hypot(wx - x, wy - y)
+                if best is None or d < best[0]: best = (d, wx, wy)
+        if best: return best
+    return None
+
+
+def snap_pose(meta, grid, points, pose, max_shift=.35, max_yaw_deg=12., step=.05, yaw_step=2., like=None):
+    """人工定位吸附：先移出障碍/未知区，再在 ±max_shift / ±max_yaw 内按吻合度微调。
+
+    候选位姿整批向量化打分（一次算完所有平移，再逐个偏航角），
+    因此在小车 Jetson 上也是几十毫秒级，不会卡住点击操作。
+    返回 dict：pose 为吸附后的位姿，shift_m/shift_deg 为微调量，score 为吻合度，
+    reason 在缺雷达(no_scan)/缺地图(no_map)时给出。只有提升 >2% 才移动。"""
+    x, y, theta = float(pose['x']), float(pose['y']), float(pose['yaw'])
+    result = {'applied': False, 'free_shift_m': 0.0, 'shift_m': 0.0, 'shift_deg': 0.0, 'score': None, 'samples': 0, 'reason': None}
+    if meta is None or grid is None:
+        result.update({'pose': {'x': x, 'y': y, 'yaw': theta}, 'reason': 'no_map'}); return result
+    free = nearest_free(meta, grid, x, y)
+    if free:
+        d, x, y = free
+        result['free_shift_m'] = round(float(d), 3); result['applied'] = d > 1e-6
+    if points is None or len(points) < 12:
+        result.update({'pose': {'x': x, 'y': y, 'yaw': theta}, 'reason': 'no_scan'}); return result
+    if like is None: like = grid_likelihood(grid, meta['resolution'])
+    points = np.asarray(points, dtype=np.float32)
+    base = pose_score(like, meta, points, x, y, theta)
+    n_shift = int(round(max_shift / step)); n_yaw = int(round(max_yaw_deg / yaw_step))
+    offs = np.arange(-n_shift, n_shift + 1, dtype=np.float32) * step
+    ox, oy = np.meshgrid(offs, offs, indexing='ij')
+    ox, oy = ox.ravel(), oy.ravel()
+    h, w = like.shape
+    best = (base, 0., 0., 0.)
+    for iy in range(-n_yaw, n_yaw + 1):
+        dth = math.radians(yaw_step * iy)
+        ca, sa = math.cos(theta + dth), math.sin(theta + dth)
+        rx = points[:, 0] * ca - points[:, 1] * sa
+        ry = points[:, 0] * sa + points[:, 1] * ca
+        col, row = world_to_cells(meta, rx[None, :] + (x + ox)[:, None], ry[None, :] + (y + oy)[:, None])
+        ok = (col >= 0) & (col < w) & (row >= 0) & (row < h)
+        cnt = ok.sum(axis=1)
+        vals = np.where(ok, like[np.clip(row, 0, h - 1), np.clip(col, 0, w - 1)], 0.).sum(axis=1)
+        scores = np.where(cnt >= 12, vals / np.maximum(cnt, 1), 0.)
+        k = int(np.argmax(scores))
+        if float(scores[k]) > best[0] + 1e-9:
+            best = (float(scores[k]), float(ox[k]), float(oy[k]), float(dth))
+    _, dx, dy, dth = best
+    # 只有明显更优、且结果本身足够吻合时才移动：环境与地图不符时宁可不吸附
+    gain = best[0] - base
+    if not (gain >= max(.06, base * .15) and best[0] >= .35):
+        if gain > 1e-6: result['reason'] = 'weak_match'
+        dx = dy = dth = 0.
+    result.update({'pose': {'x': x + dx, 'y': y + dy, 'yaw': theta + dth}, 'shift_m': round(math.hypot(dx, dy), 3),
+                   'shift_deg': round(math.degrees(dth), 1), 'score': round(best[0], 3), 'base_score': round(base, 3), 'samples': int(len(points))})
+    result['applied'] = result['applied'] or abs(dx) > 1e-9 or abs(dy) > 1e-9 or abs(dth) > 1e-9
+    return result

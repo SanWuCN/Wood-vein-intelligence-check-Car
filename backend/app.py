@@ -189,6 +189,13 @@ class Console:
             self.start_auto_localize();return {'ok':True,'state':'localizing'}
         if key==('navigation','localize'):
             p=pose_arg(body.get('pose'))
+            # 吸附微调：先移出障碍/未知区，再按雷达与地图的吻合度做小范围微调
+            snap=None
+            if not self.simulate and body.get('snap',True) is not False:
+                # 放到线程里算，避免长时间占用事件循环影响状态推流
+                try:snap=await asyncio.to_thread(self.bridge.snap_pose,p)
+                except Exception:snap=None
+                if snap and snap.get('pose'):p=snap['pose']
             validate_waypoints([p],self.bridge.map_meta,self.bridge.grid,'single')
             self.bridge.localize(p)
             if not self.simulate:
@@ -198,7 +205,7 @@ class Console:
                     except asyncio.CancelledError:pass
                     except Exception as e:self.bridge.error=str(e)
                 self.auto_task=asyncio.create_task(refine())
-            return {'ok':True,'state':'localizing'}
+            return {'ok':True,'state':'localizing','pose':p,'snap':snap}
         if key==('navigation','preview'):
             result=await self.bridge.preview(body.get('points'),body.get('mode','multi'));return {'ok':True,**result}
         if key==('navigation','start'):
