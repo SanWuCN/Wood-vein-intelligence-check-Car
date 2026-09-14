@@ -23,7 +23,7 @@ from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 from cv_bridge import CvBridge
 import cv2
-from core import ConsoleError, bounds, grid_likelihood, map_image, world_to_cell, snap_pose as core_snap_pose
+from core import ConsoleError, bounds, grid_likelihood, idle_refine_decision, map_image, world_to_cell, snap_pose as core_snap_pose
 
 
 def yaw(q):
@@ -56,6 +56,15 @@ class RosBridge(Node):
         self.error=None;self.epoch=0;self.goal_handle=None;self.pending_goal=None;self.cancel_lock=asyncio.Lock();self.mission={'state':'idle','index':0,'cycle':0,'points':[],'mode':'multi','distance_remaining':None}
         self.speed=config['default_speed_mps'];self.cv=CvBridge();self._camera_encode_at=0
         self._like=None;self._like_rev=None
+        # 静止自动校准：定位准了以后底盘静止时仍会缓慢漂移，周期性做一次小窗口吸附
+        self.refine_enabled=bool(config.get('refine_idle',True))
+        self.refine_delay=float(config.get('refine_idle_delay_s',6.))
+        self.refine_interval=float(config.get('refine_idle_interval_s',8.))
+        self.refine_shift=float(config.get('refine_idle_shift_m',.18))
+        self.refine_yaw=float(config.get('refine_idle_yaw_deg',6.))
+        self.refine_state={'enabled':self.refine_enabled,'count':0,'reason':'disabled','applied':False,'idle_s':0.,
+                           'checked_at':None,'applied_at':None,'shift_m':None,'shift_deg':None,'score':None,'base_score':None}
+        self._still_since=None;self._last_refine_at=0.
         self.buffer=Buffer();self.listener=TransformListener(self.buffer,self)
         # RViz 俯视视角跟随小车：发布一个只有平移、不旋转的辅助坐标系，地图始终朝上。
         self.view_broadcaster=TransformBroadcaster(self) if config.get('rviz_follow',True) else None
@@ -88,6 +97,7 @@ class RosBridge(Node):
         self.localization_epoch=0
         self.timer=self.create_timer(.2,self.update_tf)
         self.view_timer=self.create_timer(.2,self.publish_view_frame)
+        self.refine_timer=self.create_timer(1.,self.idle_refine_tick)
         self.speed_timer=self.create_timer(1.,self.publish_speed)
         self.spin_executor=MultiThreadedExecutor(num_threads=3);self.spin_executor.add_node(self)
         self.thread=threading.Thread(target=self.spin_executor.spin,daemon=True);self.thread.start()
@@ -271,7 +281,7 @@ class RosBridge(Node):
         ca,sa=math.cos(a),math.sin(a)
         return np.stack((arr[:,0]*ca-arr[:,1]*sa+t.x,arr[:,0]*sa+arr[:,1]*ca+t.y),axis=1)
 
-    def snap_pose(self,p):
+    def snap_pose(self,p,max_shift=.35,max_yaw_deg=12.):
         """人工定位吸附：先移出障碍/未知区，再按雷达与地图的吻合度做小范围微调。"""
         with self.lock:grid=self.grid;meta=self.map_meta
         pts=self._scan_in_base() if (grid is not None and self.mode=='navigation') else None
@@ -279,14 +289,15 @@ class RosBridge(Node):
         pose={k:float(p[k]) for k in ('x','y','yaw')}
         if self.mode!='navigation' or grid is None or meta is None:
             return {'applied':False,'free_shift_m':0.0,'shift_m':0.0,'shift_deg':0.0,'score':None,'samples':0,'reason':'no_map','pose':pose}
-        return core_snap_pose(meta,grid,pts,pose,like=like)
+        return core_snap_pose(meta,grid,pts,pose,max_shift=max_shift,max_yaw_deg=max_yaw_deg,like=like)
 
-    def localize(self,p):
+    def localize(self,p,covariance=None):
         if self.mode!='navigation':raise ConsoleError('NOT_NAVIGATING','请先加载巡航地图')
         if self.mission['state'] in ('running','accepting','pausing','paused','stopping'):raise ConsoleError('MISSION_ACTIVE','请先停止巡航')
         self.localization_epoch+=1
         msg=PoseWithCovarianceStamped();pose=self.pose_msg(p);msg.header=pose.header;msg.pose.pose=pose.pose
-        msg.pose.covariance[0]=.25;msg.pose.covariance[7]=.25;msg.pose.covariance[35]=.0685
+        var_xy,var_yaw=covariance or (.25,.0685)
+        msg.pose.covariance[0]=var_xy;msg.pose.covariance[7]=var_xy;msg.pose.covariance[35]=var_yaw
         self.amcl=None;self.error=None
         self.initial_pub.publish(msg)
         if self.nomotion.service_is_ready():self.nomotion.call_async(Empty.Request())
@@ -316,6 +327,46 @@ class RosBridge(Node):
             await asyncio.sleep(.5)
             if self.localized():return
         self.error='自动定位未收敛，可使用人工定位'
+
+    def set_idle_refine(self,enabled):
+        self.refine_enabled=bool(enabled)
+        if not self.refine_enabled:self._still_since=None
+        self.refine_state['enabled']=self.refine_enabled
+        if not self.refine_enabled:self.refine_state['reason']='disabled'
+        return self.refine_state
+
+    def idle_refine_tick(self):
+        """每秒一次：底盘静止足够久时，用当前位姿做一次小窗口吸附校准。"""
+        now=time.time()
+        with self.lock:
+            odom=self.odom;odom_at=self.odom_at;pose=self.pose;pose_at=self.pose_at;match=self.match;match_at=self.match_at
+        if not odom or now-odom_at>1.5:
+            self._still_since=None
+        else:
+            linear=odom.get('linear_mps') or 0.;angular=odom.get('angular_rps') or 0.
+            if abs(linear)>.02 or abs(angular)>.05:self._still_since=None
+            elif self._still_since is None:self._still_since=now
+        ok,reason=idle_refine_decision({'enabled':self.refine_enabled,'mode':self.mode,'mission':self.mission['state'],
+                                        'linear':odom.get('linear_mps') if odom else None,'angular':odom.get('angular_rps') if odom else None,
+                                        'still_since':self._still_since,'last_at':self._last_refine_at,'interval_s':self.refine_interval,
+                                        'delay_s':self.refine_delay,'pose_age':(now-pose_at) if pose else None,'match':match},
+                                       now)
+        self.refine_state.update({'reason':reason,'idle_s':round(now-self._still_since,1) if self._still_since else 0.,
+                                  'time':now,'match':match})
+        if not ok or not pose:return
+        self._last_refine_at=now
+        try:result=self.snap_pose({'x':pose['x'],'y':pose['y'],'yaw':pose['yaw']},max_shift=self.refine_shift,max_yaw_deg=self.refine_yaw)
+        except Exception as e:
+            self.get_logger().warning(f'idle refine: {e}');self.refine_state.update({'checked_at':now,'applied':False,'reason':'error'});return
+        shift=result.get('shift_m') or 0.;dth=abs(result.get('shift_deg') or 0.)
+        self.refine_state.update({'checked_at':now,'score':result.get('score'),'base_score':result.get('base_score')})
+        if not result.get('applied') or (shift<.005 and dth<.2):
+            self.refine_state.update({'applied':False,'reason':result.get('reason') or 'no_gain'});return
+        try:self.localize(result['pose'],covariance=(.10,.03))
+        except Exception as e:
+            self.get_logger().warning(f'idle refine publish: {e}');self.refine_state.update({'applied':False,'reason':'error'});return
+        self.refine_state.update({'applied':True,'applied_at':now,'reason':'applied','count':self.refine_state.get('count',0)+1,
+                                  'shift_m':shift,'shift_deg':result.get('shift_deg'),'pose':result['pose']})
 
     def publish_speed(self):
         msg=SpeedLimit();msg.header.stamp=self.get_clock().now().to_msg();msg.percentage=False;msg.speed_limit=self.speed
@@ -423,7 +474,7 @@ class RosBridge(Node):
             return {'mode':self.mode,'uptime_s':int(now-self.started_at),'map':self.map_meta,
                     'pose':self.pose if now-self.pose_at<2 else None,'scan_points':self.scan_points,'path':self.plan,
                     'navigation':{'ready':self.nav.server_is_ready(),'planner_ready':self.planner.server_is_ready()},
-                    'localization':{'ready':self.localized(),'match':self.match,'amcl_received':self.amcl is not None,'match_age_s':age(self.match_at),'covariance':{'x_m2':self.amcl['covariance'][0],'y_m2':self.amcl['covariance'][7],'yaw_rad2':self.amcl['covariance'][35]} if self.amcl else None},
+                    'localization':{'ready':self.localized(),'match':self.match,'refine':dict(self.refine_state),'amcl_received':self.amcl is not None,'match_age_s':age(self.match_at),'covariance':{'x_m2':self.amcl['covariance'][0],'y_m2':self.amcl['covariance'][7],'yaw_rad2':self.amcl['covariance'][35]} if self.amcl else None},
                     'velocity':self.odom if now-self.odom_at<2 else None,
                     'imu':self.imu if now-self.imu_at<2 else None,'imu_history':list(self.imu_history),
                     'lidar':{'state':'online' if now-self.scan_at<2 else 'offline','hz':hz(self.scan_times) if now-self.scan_at<2 else None,'age_s':age(self.scan_at)},

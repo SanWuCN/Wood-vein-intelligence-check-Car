@@ -236,3 +236,27 @@ def snap_pose(meta, grid, points, pose, max_shift=.35, max_yaw_deg=12., step=.05
                    'shift_deg': round(math.degrees(dth), 1), 'score': round(best[0], 3), 'base_score': round(base, 3), 'samples': int(len(points))})
     result['applied'] = result['applied'] or abs(dx) > 1e-9 or abs(dy) > 1e-9 or abs(dth) > 1e-9
     return result
+
+
+IDLE_MISSION_STATES = ('idle', 'stopped', 'completed', 'failed')
+
+
+def idle_refine_decision(state, now):
+    """静止自动校准的执行判定，返回 (是否执行, 原因)。
+
+    state 字段：enabled / mode / mission / linear / angular / still_since / last_at /
+    interval_s / delay_s / pose_age / match / match_min。
+    只在导航模式、无任务、底盘连续静止 delay_s 秒、距上次校准 interval_s 秒、
+    位姿新鲜且吻合度不低于下限时才执行；原因用于界面提示与排查。"""
+    if not state.get('enabled'): return False, 'disabled'
+    if state.get('mode') != 'navigation': return False, 'mode'
+    if state.get('mission') not in IDLE_MISSION_STATES: return False, 'mission'
+    if abs(state.get('linear') or 0) > .02 or abs(state.get('angular') or 0) > .05: return False, 'moving'
+    still = state.get('still_since')
+    if still is None: return False, 'moving'
+    if now - still < state.get('delay_s', 6.): return False, 'settling'
+    if now - (state.get('last_at') or 0.) < state.get('interval_s', 8.): return False, 'wait'
+    if (state.get('pose_age') if state.get('pose_age') is not None else 99.) > 2.: return False, 'pose_stale'
+    match = state.get('match')
+    if match is not None and match < state.get('match_min', .35): return False, 'match_low'
+    return True, 'ok'

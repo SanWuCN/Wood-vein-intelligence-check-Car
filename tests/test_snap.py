@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'backend'))
-from core import grid_likelihood, nearest_free, pose_score, snap_pose
+from core import grid_likelihood, idle_refine_decision, nearest_free, pose_score, snap_pose
 
 
 def room_grid(width=200, height=200, res=.05, origin=(-5., -5., 0.), room=(-3., -2.5, 3., 2.5)):
@@ -126,3 +126,46 @@ class SnapTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class IdleRefineTests(unittest.TestCase):
+    """静止自动校准的判定：只有导航模式、无任务、静止足够久、位姿新鲜且吻合度可用时才执行。"""
+
+    def base(self, **over):
+        s = dict(enabled=True, mode='navigation', mission='stopped', linear=0., angular=0.,
+                 still_since=100., last_at=0., interval_s=8., delay_s=6., pose_age=.2, match=.6)
+        s.update(over)
+        return s
+
+    def test_runs_when_still_and_settled(self):
+        self.assertEqual(idle_refine_decision(self.base(), 120.), (True, 'ok'))
+
+    def test_skips_when_moving(self):
+        self.assertEqual(idle_refine_decision(self.base(linear=.3), 120.)[1], 'moving')
+        self.assertEqual(idle_refine_decision(self.base(angular=.4), 120.)[1], 'moving')
+
+    def test_skips_while_settling_or_too_soon(self):
+        self.assertEqual(idle_refine_decision(self.base(still_since=118.), 120.)[1], 'settling')
+        self.assertEqual(idle_refine_decision(self.base(last_at=115.), 120.)[1], 'wait')
+
+    def test_skips_outside_navigation_and_during_mission(self):
+        self.assertEqual(idle_refine_decision(self.base(mode='mapping'), 120.)[1], 'mode')
+        self.assertEqual(idle_refine_decision(self.base(mode='idle'), 120.)[1], 'mode')
+        for m in ('running', 'paused', 'accepting', 'pausing'):
+            self.assertEqual(idle_refine_decision(self.base(mission=m), 120.)[1], 'mission')
+
+    def test_skips_when_pose_stale_or_match_low_or_disabled(self):
+        self.assertEqual(idle_refine_decision(self.base(pose_age=5.), 120.)[1], 'pose_stale')
+        self.assertEqual(idle_refine_decision(self.base(match=.2), 120.)[1], 'match_low')
+        self.assertEqual(idle_refine_decision(self.base(enabled=False), 120.)[1], 'disabled')
+
+    def test_tighter_window_still_recovers_small_drift(self):
+        # 静止漂移是小量：±0.18m/±6° 窗口应能把它拉回来
+        meta, grid = room_grid()
+        truth = {'x': -.4, 'y': .3, 'yaw': math.radians(-12.)}
+        scan = scan_from(meta, grid, truth)
+        drift = {'x': truth['x'] + .07, 'y': truth['y'] - .05, 'yaw': truth['yaw'] + math.radians(2.5)}
+        out = snap_pose(meta, grid, scan, drift, max_shift=.18, max_yaw_deg=6.)
+        self.assertTrue(out['applied'])
+        self.assertLess(math.hypot(out['pose']['x'] - truth['x'], out['pose']['y'] - truth['y']), .05)
+        self.assertLessEqual(out['shift_m'], .18 + 1e-6)

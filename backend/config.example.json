@@ -25,5 +25,10 @@
     "right": 25,
     "bottom": 39
   },
-  "rviz_follow": true
+  "rviz_follow": true,
+  "refine_idle": true,
+  "refine_idle_delay_s": 6,
+  "refine_idle_interval_s": 8,
+  "refine_idle_shift_m": 0.18,
+  "refine_idle_yaw_deg": 6
 }

@@ -187,6 +187,11 @@ class Console:
             if self.bridge.mode!='navigation':raise ConsoleError('NOT_NAVIGATING','请先加载巡航地图')
             if self.bridge.mission['state'] in ('running','accepting','paused','pausing','stopping'):raise ConsoleError('MISSION_ACTIVE','请先停止巡航')
             self.start_auto_localize();return {'ok':True,'state':'localizing'}
+        if key==('navigation','refine'):
+            enabled=body.get('enabled')
+            if not isinstance(enabled,bool):raise ConsoleError('INVALID_ARGUMENT','enabled 必须为布尔值',422)
+            return {'ok':True,'refine':self.bridge.set_idle_refine(enabled)}
+
         if key==('navigation','localize'):
             p=pose_arg(body.get('pose'))
             # 吸附微调：先移出障碍/未知区，再按雷达与地图的吻合度做小范围微调
