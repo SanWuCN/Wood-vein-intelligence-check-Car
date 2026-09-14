@@ -186,7 +186,9 @@ def snap_pose(meta, grid, points, pose, max_shift=.35, max_yaw_deg=12., step=.05
     候选位姿整批向量化打分（一次算完所有平移，再逐个偏航角），
     因此在小车 Jetson 上也是几十毫秒级，不会卡住点击操作。
     返回 dict：pose 为吸附后的位姿，shift_m/shift_deg 为微调量，score 为吻合度，
-    reason 在缺雷达(no_scan)/缺地图(no_map)时给出。只有提升 >2% 才移动。"""
+    reason 在缺雷达(no_scan)/缺地图(no_map)/判据不足(weak_match)时给出。
+    只有提升显著（≥0.06 且 ≥15%）且（结果吻合 ≥0.35 或提升 ≥0.20）才移动，
+    且候选位姿必须落在可通行栅格内。"""
     x, y, theta = float(pose['x']), float(pose['y']), float(pose['yaw'])
     result = {'applied': False, 'free_shift_m': 0.0, 'shift_m': 0.0, 'shift_deg': 0.0, 'score': None, 'samples': 0, 'reason': None}
     if meta is None or grid is None:
@@ -205,6 +207,11 @@ def snap_pose(meta, grid, points, pose, max_shift=.35, max_yaw_deg=12., step=.05
     ox, oy = np.meshgrid(offs, offs, indexing='ij')
     ox, oy = ox.ravel(), oy.ravel()
     h, w = like.shape
+    # 只接受位姿本身落在可通行栅格的候选，避免吸附到墙里（会被地图校验拒绝）
+    pc, pr = world_to_cells(meta, x + ox, y + oy)
+    inside = (pc >= 0) & (pc < w) & (pr >= 0) & (pr < h)
+    pcc, prr = np.clip(pc, 0, w - 1), np.clip(pr, 0, h - 1)
+    free = inside & (grid[prr, pcc] >= 0) & (grid[prr, pcc] <= 20)
     best = (base, 0., 0., 0.)
     for iy in range(-n_yaw, n_yaw + 1):
         dth = math.radians(yaw_step * iy)
@@ -215,14 +222,14 @@ def snap_pose(meta, grid, points, pose, max_shift=.35, max_yaw_deg=12., step=.05
         ok = (col >= 0) & (col < w) & (row >= 0) & (row < h)
         cnt = ok.sum(axis=1)
         vals = np.where(ok, like[np.clip(row, 0, h - 1), np.clip(col, 0, w - 1)], 0.).sum(axis=1)
-        scores = np.where(cnt >= 12, vals / np.maximum(cnt, 1), 0.)
+        scores = np.where(free & (cnt >= 12), vals / np.maximum(cnt, 1), 0.)
         k = int(np.argmax(scores))
         if float(scores[k]) > best[0] + 1e-9:
             best = (float(scores[k]), float(ox[k]), float(oy[k]), float(dth))
     _, dx, dy, dth = best
     # 只有明显更优、且结果本身足够吻合时才移动：环境与地图不符时宁可不吸附
     gain = best[0] - base
-    if not (gain >= max(.06, base * .15) and best[0] >= .35):
+    if not (gain >= max(.06, base * .15) and (best[0] >= .35 or gain >= .20)):
         if gain > 1e-6: result['reason'] = 'weak_match'
         dx = dy = dth = 0.
     result.update({'pose': {'x': x + dx, 'y': y + dy, 'yaw': theta + dth}, 'shift_m': round(math.hypot(dx, dy), 3),

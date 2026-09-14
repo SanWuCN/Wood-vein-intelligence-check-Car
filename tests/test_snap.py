@@ -104,6 +104,16 @@ class SnapTests(unittest.TestCase):
         self.assertEqual(out['shift_deg'], 0.0)
         self.assertIn(out['reason'], ('weak_match', None))
 
+    def test_snapped_pose_never_inside_obstacle(self):
+        # 从贴墙的位姿出发，吸附结果必须仍落在可通行栅格（否则会被地图校验拒绝）
+        like = grid_likelihood(self.grid, self.meta['resolution'])
+        for guess in ({'x': -2.98, 'y': 0., 'yaw': 0.}, {'x': 2.94, 'y': 1.2, 'yaw': math.pi},
+                      {'x': self.truth['x'], 'y': self.truth['y'], 'yaw': self.truth['yaw']}):
+            out = snap_pose(self.meta, self.grid, self.scan, guess, like=like)
+            p = out['pose']
+            i, j = int((p['x'] - self.meta['origin']['x']) / .05), int((p['y'] - self.meta['origin']['y']) / .05)
+            self.assertTrue(0 <= int(self.grid[j, i]) <= 20, f"吸附到障碍格: {guess} -> {p}")
+
     def test_nearest_free_ignores_free_point(self):
         self.assertIsNone(nearest_free(self.meta, self.grid, 0., 0.))
         # 地图范围内但房间外（未知区）：吸附到最近的室内空闲格
