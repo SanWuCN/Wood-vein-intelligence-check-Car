@@ -99,6 +99,10 @@ svg{flex-shrink:0}
 .map-scale{position:absolute;bottom:14px;left:12px;display:flex;flex-direction:column;gap:4px;font-size:10px;color:#fff;text-shadow:0 1px 2px #456;font-family:ui-monospace,monospace}
 .map-scale i{display:block;border:1px solid #fff;border-top:0;height:5px;min-width:10px}
 .map-hint.refine-hint{left:auto;right:8px;border-color:#2f4a63;color:#9fc4e6}
+.waypoint-tools{display:flex;gap:6px;margin:6px 0 0}
+.record-button{flex:1;min-height:26px;padding:3px 8px;font-size:11px;border-color:#3d5570;color:#c8d8ea}
+.record-button.active{background:#4a2f14;border-color:#c8832f;color:#ffc078}
+.record-button:disabled{opacity:.4}
 .map-hint.record-hint{top:8px;left:8px;border-color:#8a5a24;color:#ffc078;background:#241a0cd0}
 .map-hint.stale-hint{top:auto;bottom:8px;left:8px;border-color:#7a4b2a;color:#e8b57a;background:#241a0cd0}
 .map-mode{position:absolute;left:8px;top:8px;display:flex;gap:6px;align-items:center;background:#102238df;color:#ffcf66;font-size:11px;padding:4px 8px;border-radius:4px;pointer-events:none}

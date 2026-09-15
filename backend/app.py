@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import re
 import collections
 import contextlib
 import copy
@@ -37,7 +38,7 @@ class Console:
             from ros_bridge import RosBridge
             self.bridge=RosBridge(self.config)
         self.maps=MapStore(self.root/'runtime/maps');self.processes=Processes(self.root,self.config)
-        self.active_map_id=None;self.mapping_saved_grid=None;self.mapping_saved_name=None;self._mapping_status=None;self._mapping_status_rev=None;self.auto_task=None;self.tasks=[];self.media=None;self.command_lock=asyncio.Lock();self.idempotency=collections.OrderedDict()
+        self._build=None;self._build_stamp=None;self.active_map_id=None;self.mapping_saved_grid=None;self.mapping_saved_name=None;self._mapping_status=None;self._mapping_status_rev=None;self.auto_task=None;self.tasks=[];self.media=None;self.command_lock=asyncio.Lock();self.idempotency=collections.OrderedDict()
         self.metrics={'cpu_percent':None,'memory_percent':None,'temperature_c':None};self.transition=None;self.last_error=None
         self.uplink=Uplink(self.config,self.snapshot);self.routes_path=self.root/'runtime/routes.json'
         self.routes=json.loads(self.routes_path.read_text()) if self.routes_path.exists() else []
@@ -91,7 +92,20 @@ class Console:
 
     async def battery(self,req):return web.json_response(self.bridge.snapshot().get('battery',{'state':'offline'}))
     async def chassis(self,req):return web.json_response(self.bridge.snapshot().get('chassis',{'state':'offline'}))
-    async def health(self,req):return web.json_response({'ok':True,'version':'1.0.0','simulated':self.simulate})
+    def frontend_build(self):
+        """前端构建号：dist/index.html 里引用的资源名，用于判断浏览器是否需要重载。"""
+        try:
+            index=self.root/'dist'/'index.html'
+            stamp=index.stat().st_mtime
+            if self._build_stamp!=stamp:
+                text=index.read_text()
+                match=re.search(r'assets/(index-[A-Za-z0-9_.-]+)\.js',text)
+                self._build=match.group(1) if match else None
+                self._build_stamp=stamp
+            return self._build
+        except Exception:return None
+
+    async def health(self,req):return web.json_response({'ok':True,'version':'1.0.0','simulated':self.simulate,'build':self.frontend_build()})
     async def session(self,req):
         local=req.remote in ('127.0.0.1','::1')
         return web.json_response({'token':self.config['control_token'] if local else None,'can_control':local,'device_id':self.config['device_id'],'max_speed_mps':self.config['max_speed_mps']})
