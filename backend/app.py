@@ -334,7 +334,7 @@ class Console:
                 params=None
                 if mode=='navigation':
                     source=Path(self.config['workspace'])/'install/wheeltec_nav2/share/wheeltec_nav2/param/wheeltec_params/param_mini_akm.yaml'
-                    cfg=apply_forward_profile(yaml.safe_load(source.read_text()),self.root);amcl=cfg['amcl']['ros__parameters'];amcl['set_initial_pose']=False
+                    cfg=apply_forward_profile(yaml.safe_load(source.read_text()),self.root,self.config.get('cruise_arrival_radius',.25));amcl=cfg['amcl']['ros__parameters'];amcl['set_initial_pose']=False
                     params=self.root/'runtime/navigation.yaml';params.write_text(yaml.safe_dump(cfg,sort_keys=False))
                 await self.processes.stop_robot()
                 self.bridge.reset_localization();self.bridge.mode='idle'

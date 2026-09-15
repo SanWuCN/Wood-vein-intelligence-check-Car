@@ -1,9 +1,10 @@
-<!-- Continuous position-waypoint navigation, 0.40 m acceptance. Forward-only recovery: clear costmaps and wait; no spin or reverse. -->
+<!-- Continuous position-waypoint navigation. Pass radius is rendered from cruise_arrival_radius (default 0.25 m).
+     Forward-only recovery: clear costmaps and wait; no spin or reverse. -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
     <RecoveryNode number_of_retries="6" name="NavigateRecovery">
       <ReactiveSequence name="ContinuousWaypoints">
-        <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.40" global_frame="map" robot_base_frame="base_footprint"/>
+        <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.25" global_frame="map" robot_base_frame="base_footprint"/>
       <PipelineSequence name="NavigateWithReplanning">
         <RateController hz="1.0">
           <RecoveryNode number_of_retries="1" name="ComputePathThroughPoses">

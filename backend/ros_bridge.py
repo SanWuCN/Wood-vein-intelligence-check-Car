@@ -62,6 +62,7 @@ class RosBridge(Node):
         self.speed=config['default_speed_mps'];self.cv=CvBridge();self._camera_encode_at=0
         # 连续巡航：每批下发的目标点数（0=mult 全部剩余 / loop 一圈减一段）
         self.lookahead=int(config.get('cruise_lookahead',4) or 0)
+        self.arrival_radius=float(config.get('cruise_arrival_radius',.25))
         self._like=None;self._like_rev=None
         # 静止自动校准：定位准了以后底盘静止时仍会缓慢漂移，周期性做一次小窗口吸附
         self.refine_enabled=bool(config.get('refine_idle',True))
@@ -414,7 +415,7 @@ class RosBridge(Node):
         self.plan=[]
         if not self.planner.server_is_ready():raise ConsoleError('NAV_NOT_READY','路径规划器未就绪')
         goals=automatic_goals(points,pose,mode)
-        route=prune_reached_goals(goals+([goals[0]] if mode=='loop' else []),pose,.4)
+        route=prune_reached_goals(goals+([goals[0]] if mode=='loop' else []),pose,self.arrival_radius)
         if not route:raise ConsoleError('NO_PATH','起点已覆盖全部航点，请调整航点或先移动小车',409)
         req=ComputePathThroughPoses.Goal();req.goals=[self.pose_msg(p) for p in route]
         req.planner_id='GridBased';req.use_start=False

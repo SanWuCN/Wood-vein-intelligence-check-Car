@@ -80,9 +80,9 @@ class WaypointSpacingTests(unittest.TestCase):
         self.grid = np.zeros((40, 40), np.int16)
 
     def test_rejects_waypoints_too_close(self):
-        # 过近的相邻航点会让连续导航窗口终点与车位重合，控制器会立刻判到达
+        # 小于 0.30 m 的相邻航点会让连续导航窗口终点落进到点半径，控制器会立刻判到达
         with self.assertRaises(ConsoleError) as ctx:
-            validate_waypoints([{'x': 1., 'y': 1.}, {'x': 1.2, 'y': 1.}], self.meta, self.grid, 'multi')
+            validate_waypoints([{'x': 1., 'y': 1.}, {'x': 1.25, 'y': 1.}], self.meta, self.grid, 'multi')
         self.assertEqual(ctx.exception.code, 'POINTS_TOO_CLOSE')
 
     def test_rejects_loop_closure_too_close(self):
@@ -93,6 +93,12 @@ class WaypointSpacingTests(unittest.TestCase):
     def test_accepts_reasonable_spacing(self):
         out = validate_waypoints([{'x': 1., 'y': 1.}, {'x': 5., 'y': 1.}, {'x': 5., 'y': 5.}], self.meta, self.grid, 'loop')
         self.assertEqual(len(out), 3)
+
+    def test_threshold_is_0_3m(self):
+        # 0.35 m 现在应通过，0.25 m 仍应拒绝
+        self.assertEqual(len(validate_waypoints([{'x': 1., 'y': 1.}, {'x': 1.35, 'y': 1.}], self.meta, self.grid, 'multi')), 2)
+        with self.assertRaises(ConsoleError):
+            validate_waypoints([{'x': 1., 'y': 1.}, {'x': 1.25, 'y': 1.}], self.meta, self.grid, 'multi')
 
 
 if __name__ == '__main__':

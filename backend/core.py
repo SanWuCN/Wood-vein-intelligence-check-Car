@@ -42,7 +42,7 @@ def cell_to_world(meta, x, y):
     return o['x']+math.cos(a)*gx-math.sin(a)*gy, o['y']+math.sin(a)*gx+math.cos(a)*gy
 
 
-MIN_WAYPOINT_SPACING = 0.5
+MIN_WAYPOINT_SPACING = 0.3
 
 
 def validate_waypoints(points, meta, grid, mode='multi'):
