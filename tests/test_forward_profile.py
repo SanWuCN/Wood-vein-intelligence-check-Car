@@ -25,6 +25,29 @@ class ForwardProfileTests(unittest.TestCase):
   self.assertIn('runtime',cfg['bt_navigator']['ros__parameters']['default_nav_through_poses_bt_xml'])
   self.assertFalse({n.tag for n in through.iter()}&{'BackUp','Spin'})
   prior=copy.deepcopy(cfg);apply_forward_profile(cfg,root);self.assertEqual(cfg,prior)
+ def test_obstacle_clearance_becomes_effective_footprint(self):
+  root=Path(__file__).resolve().parents[1]
+  body='[ [-0.031, -0.093], [-0.031, 0.093], [0.209, 0.093], [0.209, -0.093] ]'   # 厂商参数就是字符串写法
+  cfg={'planner_server':{'ros__parameters':{'GridBased':{}}},'controller_server':{'ros__parameters':{'FollowPath':{}}},'bt_navigator':{'ros__parameters':{}},
+       'global_costmap':{'global_costmap':{'ros__parameters':{'footprint':body,'inflation_layer':{'inflation_radius':.1}}}},
+       'local_costmap':{'local_costmap':{'ros__parameters':{'footprint':body,'inflation_layer':{'inflation_radius':.1}}}}}
+  apply_forward_profile(cfg,root,.25,.30)
+  for node in ('global_costmap','local_costmap'):
+   from core import footprint_points
+   p=cfg[node][node]['ros__parameters'];self.assertIsInstance(p['footprint'],str)   # 写回字符串，Nav2 按原方式解析
+   pts=footprint_points(p['footprint']);xs=[q[0] for q in pts];ys=[q[1] for q in pts]
+   self.assertAlmostEqual((max(xs)-min(xs))/2,.30,places=3)      # 内切半径=禁区半径 → 30cm 内不可规划
+   self.assertAlmostEqual((max(xs)+min(xs))/2,.089,places=3)     # 圆套在车体几何中心
+   self.assertAlmostEqual(p['inflation_layer']['inflation_radius'],.45,places=3)
+ def test_clearance_is_configurable(self):
+  root=Path(__file__).resolve().parents[1]
+  cfg={'planner_server':{'ros__parameters':{'GridBased':{}}},'controller_server':{'ros__parameters':{'FollowPath':{}}},'bt_navigator':{'ros__parameters':{}},
+       'local_costmap':{'local_costmap':{'ros__parameters':{'footprint':[[0,0],[1,0],[1,1],[0,1]]}}}}
+  apply_forward_profile(cfg,root,.25,.5)
+  from core import footprint_points
+  p=cfg['local_costmap']['local_costmap']['ros__parameters']
+  xs=[q[0] for q in footprint_points(p['footprint'])]
+  self.assertAlmostEqual((max(xs)-min(xs))/2,.5,places=3)
  def test_arrival_radius_is_configurable(self):
   root=Path(__file__).resolve().parents[1]
   cfg={'planner_server':{'ros__parameters':{'GridBased':{}}},'controller_server':{'ros__parameters':{'FollowPath':{}}},'bt_navigator':{'ros__parameters':{}}}

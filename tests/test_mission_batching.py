@@ -5,8 +5,9 @@ import unittest
 from pathlib import Path
 import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'backend'))
-from core import (ConsoleError, lap_number, plan_batch, points_within, prune_reached_goals,
-                  remaining_route_distance, start_conflict, validate_waypoints, waypoint_index)
+from core import (ConsoleError, circle_footprint, footprint_center, footprint_points, footprint_text, lap_number, plan_batch, points_within,
+                  prune_reached_goals, record_step, remaining_route_distance, start_conflict,
+                  validate_waypoints, waypoint_index)
 
 
 def goals(*xy):
@@ -141,3 +142,27 @@ class PointsWithinTests(unittest.TestCase):
         self.assertEqual(points_within(pts, {'x': 1., 'y': 1., 'yaw': 0.}, .1), 1)
         self.assertEqual(points_within(pts, None, .4), 0)
         self.assertEqual(points_within([], {'x': 1., 'y': 1., 'yaw': 0.}, .4), 0)
+
+
+class ClearanceTests(unittest.TestCase):
+    def test_circle_footprint_is_centered_circle(self):
+        fp = circle_footprint(.30, (.089, 0.))
+        self.assertEqual(len(fp), 16)
+        r = [math.hypot(p[0] - .089, p[1]) for p in fp]
+        self.assertAlmostEqual(min(r), .30, places=3)
+        self.assertAlmostEqual(max(r), .30, places=3)
+
+    def test_footprint_center_of_ackermann_body(self):
+        nested = [[-.031, -.093], [-.031, .093], [.209, .093], [.209, -.093]]
+        self.assertEqual(footprint_center(nested), (.089, 0.))
+        # 厂商参数里 footprint 是字符串，必须能解析
+        self.assertEqual(footprint_center('[ [-0.031, -0.093], [-0.031, 0.093], [0.209, 0.093], [0.209, -0.093] ]'), (.089, 0.))
+        self.assertEqual(footprint_center(''), (0., 0.))
+        self.assertEqual(footprint_center([]), (0., 0.))
+
+    def test_record_step_only_after_min_distance(self):
+        self.assertEqual(record_step([], {'x': 1.2345, 'y': 2.3456, 'yaw': 0.}, .2), [1.234, 2.346])
+        pts = [[1.0, 1.0]]
+        self.assertIsNone(record_step(pts, {'x': 1.1, 'y': 1.0, 'yaw': 0.}, .2))
+        self.assertEqual(record_step(pts, {'x': 1.2, 'y': 1.0, 'yaw': 0.}, .2), [1.2, 1.0])
+        self.assertIsNone(record_step(pts, None, .2))

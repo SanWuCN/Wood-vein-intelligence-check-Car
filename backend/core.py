@@ -380,3 +380,48 @@ def points_within(points, pose, radius):
     if not points or not pose: return 0
     r2 = radius * radius
     return sum(1 for p in points if (p[0] - pose['x']) ** 2 + (p[1] - pose['y']) ** 2 <= r2)
+
+
+def circle_footprint(radius, center=(0., 0.), segments=16):
+    """半径为 radius 的圆形有效足迹（多边形近似，用于把障碍周边设为禁区）。"""
+    r = max(.05, float(radius)); cx, cy = float(center[0]), float(center[1])
+    return [[round(cx + r * math.cos(2 * math.pi * i / segments), 4),
+             round(cy + r * math.sin(2 * math.pi * i / segments), 4)] for i in range(segments)]
+
+
+def footprint_points(footprint):
+    """解析足迹，兼容厂商字符串写法 '[ [x, y], ... ]'、嵌套列表与扁平列表。"""
+    if isinstance(footprint, str):
+        try: footprint = yaml.safe_load(footprint)
+        except Exception: return []
+    if not isinstance(footprint, (list, tuple)) or not footprint: return []
+    if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in footprint):
+        return [[float(footprint[i]), float(footprint[i + 1])] for i in range(0, len(footprint) - 1, 2)]
+    out = []
+    for item in footprint:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            out.append([float(item[0]), float(item[1])])
+    return out
+
+
+def footprint_text(points):
+    """写回厂商使用的字符串写法，保证 Nav2 解析方式与原来一致。"""
+    return '[ ' + ', '.join('[%.4f, %.4f]' % (float(p[0]), float(p[1])) for p in points) + ' ]'
+
+
+def footprint_center(footprint):
+    """足迹多边形中心（用于把圆形禁区套在车体几何中心上）。"""
+    pts = footprint_points(footprint)
+    if not pts: return (0., 0.)
+    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+    return ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)
+
+
+def record_step(points, pose, step):
+    """航迹记录：距上一个记录点不足 step 米就不记（返回 None），否则返回该点。"""
+    if not pose: return None
+    x, y = round(float(pose['x']), 3), round(float(pose['y']), 3)
+    if points:
+        lx, ly = points[-1][0], points[-1][1]
+        if math.hypot(x - lx, y - ly) < step - 1e-9: return None   # 恰好等于步长也应记录
+    return [x, y]

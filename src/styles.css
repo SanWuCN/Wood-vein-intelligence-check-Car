@@ -99,6 +99,8 @@ svg{flex-shrink:0}
 .map-scale{position:absolute;bottom:14px;left:12px;display:flex;flex-direction:column;gap:4px;font-size:10px;color:#fff;text-shadow:0 1px 2px #456;font-family:ui-monospace,monospace}
 .map-scale i{display:block;border:1px solid #fff;border-top:0;height:5px;min-width:10px}
 .map-hint.refine-hint{left:auto;right:8px;border-color:#2f4a63;color:#9fc4e6}
+.map-hint.record-hint{top:8px;left:8px;border-color:#8a5a24;color:#ffc078;background:#241a0cd0}
+.map-hint.stale-hint{top:auto;bottom:8px;left:8px;border-color:#7a4b2a;color:#e8b57a;background:#241a0cd0}
 .map-mode{position:absolute;left:8px;top:8px;display:flex;gap:6px;align-items:center;background:#102238df;color:#ffcf66;font-size:11px;padding:4px 8px;border-radius:4px;pointer-events:none}
 .localization-state{font-size:11px;color:var(--amber);white-space:nowrap}
 .localization-state.online{color:var(--green)}

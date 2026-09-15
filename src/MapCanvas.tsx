@@ -2,8 +2,8 @@ import {useEffect,useRef,useState} from 'react';
 import {Plus,Minus,Maximize,MousePointer2,Navigation} from 'lucide-react';
 import type {MapMeta,Pose,Waypoint} from './types';
 import {worldToImage,imageToWorld} from './geometry';
-type Props={meta:MapMeta|null;pose:Pose|null;scan:number[][];path:Pose[];points:Waypoint[];tool:'browse'|'pose'|'waypoint';onPlace:(p:Pose)=>void;enabled:boolean};
-export function MapCanvas({meta,pose,scan,path,points,tool,onPlace,enabled}:Props){
+type Props={meta:MapMeta|null;pose:Pose|null;scan:number[][];path:Pose[];points:Waypoint[];record?:Waypoint[];tool:'browse'|'pose'|'waypoint';onPlace:(p:Pose)=>void;enabled:boolean};
+export function MapCanvas({meta,pose,scan,path,points,record,tool,onPlace,enabled}:Props){
  const canvas=useRef<HTMLCanvasElement>(null),container=useRef<HTMLDivElement>(null),image=useRef<HTMLImageElement|null>(null);
  const [size,setSize]=useState({width:800,height:500}),[loaded,setLoaded]=useState(0),[view,setView]=useState({scale:1,x:0,y:0}),[draft,setDraft]=useState<{start:Pose;end:Pose}|null>(null);
  const drag=useRef<{screen:{x:number;y:number};view:typeof view;start:Pose;pan:boolean}|null>(null);
@@ -23,6 +23,8 @@ export function MapCanvas({meta,pose,scan,path,points,tool,onPlace,enabled}:Prop
  if(meter>15){const step=Math.ceil(35/meter);for(let i=0;i<meta.width*meta.resolution;i+=step){let x=view.x+i/meta.resolution*view.scale;c.beginPath();c.moveTo(x,0);c.lineTo(x,size.height);c.stroke()}for(let i=0;i<meta.height*meta.resolution;i+=step){let y=view.y+i/meta.resolution*view.scale;c.beginPath();c.moveTo(0,y);c.lineTo(size.width,y);c.stroke()}}
  const line=(ps:Waypoint[],color:string,dash:number[])=>{if(ps.length<2)return;c.strokeStyle=color;c.lineWidth=2.5;c.setLineDash(dash);c.beginPath();ps.forEach((p,i)=>{const s=screen(p);i?c.lineTo(s.x,s.y):c.moveTo(s.x,s.y)});c.stroke();c.setLineDash([])};
  line(path,'#31d6b8',[]);line(points,'#418cff',[7,6]);
+ if(record&&record.length>1)line(record as unknown as Pose[],'#ff9f43',[]);
+ c.fillStyle='#ffb765';(record||[]).forEach((p)=>{const s=screen(p);c.fillRect(s.x-1.3,s.y-1.3,2.6,2.6)});
  c.fillStyle='#ff626b';scan.forEach(([x,y])=>{const p=screen({x,y});c.fillRect(p.x-1,p.y-1,2.3,2.3)});
  points.forEach((p,i)=>{const s=screen(p);c.beginPath();c.arc(s.x,s.y,12,0,Math.PI*2);c.fillStyle='#377fff';c.fill();c.strokeStyle='#d9e9ff';c.lineWidth=1.5;c.stroke();c.fillStyle='#fff';c.font='600 12px system-ui';c.textAlign='center';c.textBaseline='middle';c.fillText(String(i+1),s.x,s.y)});
  const arrow=(p:Pose,color:string)=>{const s=screen(p);c.save();c.translate(s.x,s.y);c.rotate(-(p.yaw-meta.origin.yaw));c.fillStyle=color+'30';c.beginPath();c.arc(0,0,22,0,Math.PI*2);c.fill();c.fillStyle=color;c.strokeStyle='#e5ffff';c.lineWidth=1.2;c.beginPath();c.moveTo(14,0);c.lineTo(-9,-8);c.lineTo(-4,0);c.lineTo(-9,8);c.closePath();c.fill();c.stroke();c.restore()};

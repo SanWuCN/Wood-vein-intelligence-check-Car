@@ -40,7 +40,7 @@ class NavigationValidationTests(unittest.IsolatedAsyncioTestCase):
         self.b=SimpleNamespace(mode='navigation',localized=lambda:True,lock=threading.RLock(),
             map_meta={'width':5,'height':5,'resolution':1.0,'origin':{'x':0,'y':0,'yaw':0}},
             grid=np.zeros((5,5),dtype=np.int16),plan=[],pose={'x':0.,'y':0.,'yaw':0.},pose_msg=pose_msg,
-            arrival_radius=.15,lookahead=4,
+            arrival_radius=.15,lookahead=4,clearance=.30,
             planner=SimpleNamespace(server_is_ready=lambda:True,send_goal_async=send),
             nav=SimpleNamespace(server_is_ready=lambda:True),mission={'state':'stopped'},epoch=0,error=None,
             publish_speed=Mock(),_send_nav=Mock())

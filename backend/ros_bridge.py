@@ -26,7 +26,7 @@ from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 from cv_bridge import CvBridge
 import cv2
 from core import (ConsoleError, automatic_goals, bounds, grid_likelihood, idle_refine_decision, lap_number,
-                    map_image, plan_batch, points_within, prune_reached_goals, remaining_route_distance, start_conflict,
+                    map_image, plan_batch, points_within, prune_reached_goals, record_step, remaining_route_distance, start_conflict,
                     validate_waypoints, waypoint_index,
                     world_to_cell, snap_pose as core_snap_pose)
 
@@ -63,7 +63,12 @@ class RosBridge(Node):
         # 连续巡航：每批下发的目标点数（0=mult 全部剩余 / loop 一圈减一段）
         self.lookahead=int(config.get('cruise_lookahead',4) or 0)
         self.arrival_radius=float(config.get('cruise_arrival_radius',.25))
+        self.clearance=float(config.get('cruise_clearance',.30))
         self._like=None;self._like_rev=None
+        # 航迹记录（遥控教学）：每 record_step_m 米记一个点，直接可存成路线
+        self.record_step_m=float(config.get('record_step_m',.2))
+        self.record_max=int(config.get('record_max_points',800))
+        self.record={'active':False,'count':0,'distance_m':0.,'points':[],'started_at':None}
         # 静止自动校准：定位准了以后底盘静止时仍会缓慢漂移，周期性做一次小窗口吸附
         self.refine_enabled=bool(config.get('refine_idle',True))
         self.refine_delay=float(config.get('refine_idle_delay_s',6.))
@@ -107,6 +112,7 @@ class RosBridge(Node):
         self.timer=self.create_timer(.2,self.update_tf)
         self.view_timer=self.create_timer(.2,self.publish_view_frame)
         self.refine_timer=self.create_timer(1.,self.idle_refine_tick)
+        self.record_timer=self.create_timer(.2,self.record_tick)
         self.speed_timer=self.create_timer(1.,self.publish_speed)
         self.spin_executor=MultiThreadedExecutor(num_threads=3);self.spin_executor.add_node(self)
         self.thread=threading.Thread(target=self.spin_executor.spin,daemon=True);self.thread.start()
@@ -359,6 +365,32 @@ class RosBridge(Node):
             if self.localized():return
         self.error='自动定位未收敛，可使用人工定位'
 
+    # ---- 航迹记录（遥控教学） ---------------------------------------------
+    def record_command(self,action):
+        """start / stop / clear：记录遥控行驶轨迹，每 record_step_m 米一个航点。"""
+        with self.lock:
+            if action=='start':
+                if not self.pose:raise ConsoleError('NOT_LOCALIZED','还没有可用位姿，请先建图或定位')
+                self.record={'active':True,'count':0,'distance_m':0.,'points':[],'started_at':time.time()}
+            elif action=='stop':
+                self.record['active']=False
+            elif action=='clear':
+                self.record={'active':False,'count':0,'distance_m':0.,'points':[],'started_at':None}
+            else:raise ConsoleError('INVALID_ARGUMENT','记录动作无效',422)
+            return dict(self.record,points=list(self.record['points']))
+
+    def record_tick(self):
+        with self.lock:
+            if not self.record['active']:return
+            pose=self.pose if time.time()-self.pose_at<1. else None
+            points=self.record['points']
+            if len(points)>=self.record_max:
+                self.record['active']=False;return
+            step=record_step(points,pose,self.record_step_m)
+            if not step:return
+            if points:self.record['distance_m']=round(self.record['distance_m']+math.hypot(step[0]-points[-1][0],step[1]-points[-1][1]),2)
+            points.append(step);self.record['count']=len(points)
+
     def set_idle_refine(self,enabled):
         self.refine_enabled=bool(enabled)
         if not self.refine_enabled:self._still_since=None
@@ -410,8 +442,8 @@ class RosBridge(Node):
         with self.lock:
             points=validate_waypoints(points,self.map_meta,self.grid,mode)
             pose=self.pose;meta=self.map_meta;grid=self.grid
-        if start_conflict(meta,grid,pose):
-            raise ConsoleError('START_BLOCKED','当前位置与地图不符（车压在障碍或膨胀区上），请重新定位后再预览',409)
+        if start_conflict(meta,grid,pose,self.clearance):
+            raise ConsoleError('START_BLOCKED',f'当前位置离障碍不足 {self.clearance:g} m（或与地图不符），请把车移开一些再预览',409)
         self.plan=[]
         if not self.planner.server_is_ready():raise ConsoleError('NAV_NOT_READY','路径规划器未就绪')
         goals=automatic_goals(points,pose,mode)
@@ -438,8 +470,8 @@ class RosBridge(Node):
             if not self.localized():raise ConsoleError('NOT_LOCALIZED','请先完成定位')
             if not self.nav.server_is_ready():raise ConsoleError('NAV_NOT_READY','导航服务未就绪')
             points=validate_waypoints(points,self.map_meta,self.grid,mode)
-            if start_conflict(self.map_meta,self.grid,self.pose):
-                raise ConsoleError('START_BLOCKED','当前位置与地图不符（车压在障碍或膨胀区上），请重新定位后再开始巡航',409)
+            if start_conflict(self.map_meta,self.grid,self.pose,self.clearance):
+                raise ConsoleError('START_BLOCKED',f'当前位置离障碍不足 {self.clearance:g} m（或与地图不符），请把车移开一些再开始巡航',409)
             self.navigation_goals=automatic_goals(points,self.pose,mode)
             self.route_cursor=0
             self.epoch+=1
@@ -554,7 +586,7 @@ class RosBridge(Node):
                     'imu':self.imu if now-self.imu_at<2 else None,'imu_history':list(self.imu_history),
                     'lidar':{'state':'online' if now-self.scan_at<2 else 'offline','hz':hz(self.scan_times) if now-self.scan_at<2 else None,'age_s':age(self.scan_at)},
                     'camera':{'state':'online' if now-self.camera_at<3 else 'offline','size':self.camera_size,'fps':hz(self.camera_times) if now-self.camera_at<3 else None,'age_s':age(self.camera_at)},
-                    'mission':dict(self.mission),'speed_mps':self.speed,'battery_voltage':self.battery_voltage if now-self.voltage_at<5 else None,
+                    'mission':dict(self.mission),'record':{'active':self.record['active'],'count':self.record['count'],'distance_m':self.record['distance_m'],'points':self.record['points']},'speed_mps':self.speed,'battery_voltage':self.battery_voltage if now-self.voltage_at<5 else None,
                     'battery':{'state':'online' if now-self.voltage_at<5 or now-self.bms_at<5 else 'offline','voltage_v':self.battery_voltage if now-self.voltage_at<5 else None,'age_s':age(self.voltage_at),'percentage':self.bms['percentage'] if self.bms and now-self.bms_at<5 else None,'charging':self.charging if now-self.charging_at<5 else None,'charging_current_a':self.charging_current if now-self.current_at<5 else None,'bms':self.bms if now-self.bms_at<5 else None},
                     'chassis':{'state':'online' if now-self.raw_odom_at<2 else 'offline','model':'mini_akm','drive_type':'ackermann','age_s':age(self.raw_odom_at),'odometry':self.raw_odom if now-self.raw_odom_at<2 else None,'commanded_velocity':self.commanded if now-self.commanded_at<2 else None,'command_age_s':age(self.commanded_at)},'error':self.error}
 

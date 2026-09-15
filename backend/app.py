@@ -193,6 +193,9 @@ class Console:
             if self.bridge.mode!='navigation':raise ConsoleError('NOT_NAVIGATING','请先加载巡航地图')
             if self.bridge.mission['state'] in ('running','accepting','paused','pausing','stopping'):raise ConsoleError('MISSION_ACTIVE','请先停止巡航')
             self.start_auto_localize();return {'ok':True,'state':'localizing'}
+        if key==('record','start') or key==('record','stop') or key==('record','clear'):
+            return {'ok':True,'record':self.bridge.record_command(action)}
+
         if key==('navigation','refine'):
             enabled=body.get('enabled')
             if not isinstance(enabled,bool):raise ConsoleError('INVALID_ARGUMENT','enabled 必须为布尔值',422)
@@ -334,7 +337,7 @@ class Console:
                 params=None
                 if mode=='navigation':
                     source=Path(self.config['workspace'])/'install/wheeltec_nav2/share/wheeltec_nav2/param/wheeltec_params/param_mini_akm.yaml'
-                    cfg=apply_forward_profile(yaml.safe_load(source.read_text()),self.root,self.config.get('cruise_arrival_radius',.25));amcl=cfg['amcl']['ros__parameters'];amcl['set_initial_pose']=False
+                    cfg=apply_forward_profile(yaml.safe_load(source.read_text()),self.root,self.config.get('cruise_arrival_radius',.25),self.config.get('cruise_clearance',.30));amcl=cfg['amcl']['ros__parameters'];amcl['set_initial_pose']=False
                     params=self.root/'runtime/navigation.yaml';params.write_text(yaml.safe_dump(cfg,sort_keys=False))
                 await self.processes.stop_robot()
                 self.bridge.reset_localization();self.bridge.mode='idle'
