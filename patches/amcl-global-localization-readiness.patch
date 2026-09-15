@@ -1,0 +1,20 @@
+--- a/nav2_amcl/src/amcl_node.cpp
++++ b/nav2_amcl/src/amcl_node.cpp
+@@ -482,6 +482,17 @@
+   std::shared_ptr<std_srvs::srv::Empty::Response>/*res*/)
+ {
+   std::lock_guard<std::recursive_mutex> cfl(mutex_);
++
++  if (!active_ || !first_map_received_ || map_ == nullptr || pf_ == nullptr) {
++    RCLCPP_WARN(get_logger(), "Global localization deferred: AMCL or map is not ready");
++    return;
++  }
++#if NEW_UNIFORM_SAMPLING
++  if (free_space_indices.empty()) {
++    RCLCPP_WARN(get_logger(), "Global localization deferred: map has no free cells");
++    return;
++  }
++#endif
+ 
+   RCLCPP_INFO(get_logger(), "Initializing with uniform distribution");
+ 

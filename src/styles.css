@@ -235,3 +235,29 @@ svg{flex-shrink:0}
   .waypoints{min-height:36px}
   .telemetry-grid{grid-auto-rows:minmax(20px,1fr)}
 }
+
+/* Route summary stays compact; editing uses the full screen's available height. */
+.waypoint-preview{display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;gap:8px;flex:1 1 0;min-height:60px;padding:10px;overflow:hidden;text-align:left;background:#0d2031;border:1px dashed #315673;color:var(--text)}
+.waypoint-preview-head{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;flex-shrink:0}
+.waypoint-preview-head>span{display:flex;align-items:center;gap:5px;color:#a7c8de}
+.waypoint-preview-list{display:flex;flex-direction:column;gap:6px;overflow:hidden;min-height:0;flex:1;mask-image:linear-gradient(#000 75%,transparent)}
+.waypoint-preview-row{display:grid;grid-template-columns:24px 1fr 1fr;align-items:center;gap:6px;font:11px ui-monospace,monospace;min-height:24px}
+.waypoint-preview-empty{display:flex;align-items:center;justify-content:center;gap:8px;flex:1;min-height:30px;color:#a7c8de}
+.waypoint-editor[open]{display:flex;flex-direction:column;width:900px;height:min(680px,calc(100dvh - 32px));max-height:calc(100dvh - 32px);padding:20px;overflow:hidden;box-sizing:border-box}
+.waypoint-editor .modal-title{flex-shrink:0;margin-bottom:12px}
+.waypoint-editor .modal-title h2{font-size:20px}.waypoint-editor h2 span{font:14px ui-monospace,monospace;color:#a7c8de;margin-left:12px}
+.waypoint-editor .modal-title button,.waypoint-editor button{min-height:44px;min-width:44px}
+.waypoint-editor-columns,.waypoint-editor-row{display:grid;grid-template-columns:44px repeat(2,minmax(0,1fr)) 148px;gap:12px;align-items:center}
+.waypoint-editor-columns{padding:8px 12px 12px;color:#a7c8de;font-size:13px;flex-shrink:0}
+.waypoint-editor-scroll{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding:0 4px 8px 0}
+.waypoint-editor-row{padding:12px;border:1px solid #2e4560;border-radius:6px;background:#0d2031;margin-bottom:8px}
+.waypoint-editor-row .waypoint-number{width:30px;height:30px;font-size:13px}
+.waypoint-editor-row label{min-width:0}.waypoint-editor-row label input{height:44px;font-size:18px;padding:6px 10px;box-sizing:border-box;font-variant-numeric:tabular-nums}
+.waypoint-editor-row input[aria-invalid=true]{border-color:#ee7885}
+.editor-row-actions{display:flex;gap:8px}.editor-row-actions button{padding:0;width:44px}.editor-row-actions button:last-child{color:#ffa1ac}
+.wp-mobile-label{display:none}.editor-empty{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:#a7c8de}
+.editor-footer{display:flex;justify-content:space-between;gap:12px;padding-top:14px;border-top:1px solid #2e4560;flex-shrink:0}.editor-footer>div{display:flex;gap:12px}.editor-footer button{font-size:14px;padding:0 18px}
+.editor-validation{font-size:13px;color:#ffa1ac;padding:8px 0}
+@media(max-width:650px){.waypoint-editor[open]{padding:12px}.waypoint-editor-columns{display:none}.waypoint-editor-row{grid-template-columns:30px repeat(2,minmax(0,1fr));gap:8px}.editor-row-actions{grid-column:2/-1;justify-content:flex-end}.wp-mobile-label{display:block;font-size:12px}.waypoint-editor-row label input{font-size:15px;padding:4px}.editor-footer{gap:8px}.editor-footer>div{gap:8px}.editor-footer button{padding:0 10px;font-size:12px}}
+
+@media(max-width:650px){.editor-footer{flex-wrap:wrap}.editor-footer>div{margin-left:auto}}

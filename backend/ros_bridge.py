@@ -16,14 +16,19 @@ from rclpy.duration import Duration
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TransformStamped, Twist
 from sensor_msgs.msg import LaserScan, Imu, BatteryState, Image as RosImage
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as RosPath
-from nav2_msgs.action import NavigateToPose, ComputePathToPose
+from nav2_msgs.action import NavigateThroughPoses, ComputePathThroughPoses
 from nav2_msgs.msg import SpeedLimit
 from std_msgs.msg import Float32, Bool
 from std_srvs.srv import Empty
+from lifecycle_msgs.srv import GetState
+from lifecycle_msgs.msg import State
 from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 from cv_bridge import CvBridge
 import cv2
-from core import ConsoleError, bounds, grid_likelihood, idle_refine_decision, map_image, world_to_cell, snap_pose as core_snap_pose
+from core import (ConsoleError, automatic_goals, bounds, grid_likelihood, idle_refine_decision, lap_number,
+                    map_image, plan_batch, points_within, prune_reached_goals, remaining_route_distance, start_conflict,
+                    validate_waypoints, waypoint_index,
+                    world_to_cell, snap_pose as core_snap_pose)
 
 
 def yaw(q):
@@ -55,6 +60,8 @@ class RosBridge(Node):
         self.camera_jpeg=None;self.camera_at=0;self.camera_times=deque(maxlen=60);self.battery_voltage=None;self.voltage_at=0;self.bms=None;self.bms_at=0;self.charging=None;self.charging_at=0;self.charging_current=None;self.current_at=0;self.raw_odom=None;self.raw_odom_at=0;self.commanded=None;self.commanded_at=0;self.camera_size=None
         self.error=None;self.epoch=0;self.goal_handle=None;self.pending_goal=None;self.cancel_lock=asyncio.Lock();self.mission={'state':'idle','index':0,'cycle':0,'points':[],'mode':'multi','distance_remaining':None}
         self.speed=config['default_speed_mps'];self.cv=CvBridge();self._camera_encode_at=0
+        # 连续巡航：每批下发的目标点数（0=mult 全部剩余 / loop 一圈减一段）
+        self.lookahead=int(config.get('cruise_lookahead',4) or 0)
         self._like=None;self._like_rev=None
         # 静止自动校准：定位准了以后底盘静止时仍会缓慢漂移，周期性做一次小窗口吸附
         self.refine_enabled=bool(config.get('refine_idle',True))
@@ -90,10 +97,11 @@ class RosBridge(Node):
         self.initial_pub=self.create_publisher(PoseWithCovarianceStamped,'/initialpose',10)
         self.stop_pub=self.create_publisher(Twist,'/cmd_vel',10)
         self.speed_pub=self.create_publisher(SpeedLimit,'/speed_limit',QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self.nav=ActionClient(self,NavigateToPose,'/navigate_to_pose')
-        self.planner=ActionClient(self,ComputePathToPose,'/compute_path_to_pose')
+        self.nav=ActionClient(self,NavigateThroughPoses,'/navigate_through_poses')
+        self.planner=ActionClient(self,ComputePathThroughPoses,'/compute_path_through_poses')
         self.nomotion=self.create_client(Empty,'/request_nomotion_update')
         self.global_localizer=self.create_client(Empty,'/reinitialize_global_localization')
+        self.amcl_lifecycle=self.create_client(GetState,'/amcl/get_state')
         self.localization_epoch=0
         self.timer=self.create_timer(.2,self.update_tf)
         self.view_timer=self.create_timer(.2,self.publish_view_frame)
@@ -209,13 +217,15 @@ class RosBridge(Node):
             pose={'x':t.x,'y':t.y,'yaw':yaw(q)}
             with self.lock:self.pose=pose;self.pose_at=time.time()
         except Exception:
-            with self.lock:self.match=None;self.pose_at=0
+            with self.lock:self.match=None;self.pose_at=0;self.scan_points=[]
             return
         with self.lock:scan=self.last_scan;grid=self.grid;meta=self.map_meta;scan_at=self.scan_at
         if scan is None or time.time()-scan_at>2:return
         try:
             tf=self.buffer.lookup_transform('map',scan.header.frame_id,Time.from_msg(scan.header.stamp),timeout=Duration(seconds=.08))
-        except Exception:return
+        except Exception:
+            with self.lock:self.scan_points=[];self.match=None
+            return
         a=yaw(tf.transform.rotation);t=tf.transform.translation;points=[];hits=0;total=0
         step=max(1,len(scan.ranges)//220)
         for i in range(0,len(scan.ranges),step):
@@ -238,6 +248,10 @@ class RosBridge(Node):
         with self.lock:
             self.amcl=None;self.amcl_at=0;self.match=None;self.pose=None;self.pose_at=0;self.match_at=0;self.plan=[];self.scan_points=[]
             self.map_meta=None;self.grid=None;self.map_png=None;self._last_map_stamp=None
+            self.odom=None;self.odom_at=0;self.imu=None;self.imu_at=0;self.raw_odom=None;self.raw_odom_at=0
+            self.last_scan=None;self.scan_at=0;self.scan_times.clear();self.imu_history.clear()
+            self.error=None;self._still_since=None;self._last_refine_at=0
+            self.refine_state.update({'reason':'waiting_data','applied':False,'idle_s':0.,'checked_at':None})
         self.buffer.clear()
 
     def localized(self):
@@ -314,15 +328,31 @@ class RosBridge(Node):
         if self.mode!='navigation':raise ConsoleError('NOT_NAVIGATING','请先加载巡航地图')
         if self.mission['state'] in ('running','accepting','pausing','paused','stopping'):raise ConsoleError('MISSION_ACTIVE','请先停止巡航')
         self.localization_epoch+=1;ticket=self.localization_epoch
-        self.amcl=None
+        self.error=None
+        # Services exist during configure, before AMCL is safe to initialize.
+        # Wait for the lifecycle transition AND receipt of the new map.
         for _ in range(90):
             if ticket!=self.localization_epoch or self.mode!='navigation':return
-            if self.global_localizer.service_is_ready():break
+            if self.map_meta and self.amcl_lifecycle.service_is_ready():
+                try:
+                    state=await ros_future(self.amcl_lifecycle.call_async(GetState.Request()),2)
+                    if (state.current_state.id==State.PRIMARY_STATE_ACTIVE
+                            and self.global_localizer.service_is_ready()):break
+                except ConsoleError:pass
             await asyncio.sleep(.5)
-        else:raise ConsoleError('NAV_NOT_READY','定位服务未就绪')
-        await ros_future(self.global_localizer.call_async(Empty.Request()))
-        for _ in range(60):
+        else:raise ConsoleError('NAV_NOT_READY','定位模块未就绪，请重新加载地图')
+        if ticket!=self.localization_epoch or self.mode!='navigation':return
+        self.amcl=None
+        try:await ros_future(self.global_localizer.call_async(Empty.Request()))
+        except ConsoleError as e:
+            raise ConsoleError('LOCALIZATION_UNAVAILABLE','定位服务无响应，请重新加载地图',503) from e
+        for attempt in range(60):
             if ticket!=self.localization_epoch or self.mode!='navigation':return
+            # A guarded early AMCL request returns Empty even if its map callback
+            # has not run. Retry only until the first pose arrives, never reset
+            # an already converging particle filter.
+            if attempt in (10,20) and self.amcl is None:
+                await ros_future(self.global_localizer.call_async(Empty.Request()))
             if self.nomotion.service_is_ready():await ros_future(self.nomotion.call_async(Empty.Request()),3)
             await asyncio.sleep(.5)
             if self.localized():return
@@ -351,6 +381,7 @@ class RosBridge(Node):
                                         'still_since':self._still_since,'last_at':self._last_refine_at,'interval_s':self.refine_interval,
                                         'delay_s':self.refine_delay,'pose_age':(now-pose_at) if pose else None,'match':match},
                                        now)
+        if not odom or now-odom_at>1.5:reason='waiting_data'
         self.refine_state.update({'reason':reason,'idle_s':round(now-self._still_since,1) if self._still_since else 0.,
                                   'time':now,'match':match})
         if not ok or not pose:return
@@ -375,20 +406,28 @@ class RosBridge(Node):
     async def preview(self,points,mode):
         if self.mode!='navigation':raise ConsoleError('NOT_NAVIGATING','请先加载巡航地图')
         if not self.localized():raise ConsoleError('NOT_LOCALIZED','请先完成定位')
-        with self.lock:points=validate_waypoints(points,self.map_meta,self.grid,mode)
+        with self.lock:
+            points=validate_waypoints(points,self.map_meta,self.grid,mode)
+            pose=self.pose;meta=self.map_meta;grid=self.grid
+        if start_conflict(meta,grid,pose):
+            raise ConsoleError('START_BLOCKED','当前位置与地图不符（车压在障碍或膨胀区上），请重新定位后再预览',409)
         self.plan=[]
         if not self.planner.server_is_ready():raise ConsoleError('NAV_NOT_READY','路径规划器未就绪')
-        output=[];route=points+([points[0]] if mode=='loop' else [])
-        for i,p in enumerate(route):
-            req=ComputePathToPose.Goal();req.goal=self.pose_msg(p);req.planner_id='';req.use_start=i>0
-            if i>0:req.start=self.pose_msg(route[i-1])
-            handle=await ros_future(self.planner.send_goal_async(req))
-            if not handle.accepted:raise ConsoleError('PLAN_REJECTED','路径规划被拒绝')
-            try:result=await ros_future(handle.get_result_async(),20)
-            except Exception:
-                handle.cancel_goal_async();raise
-            if result.status!=4 or not result.result.path.poses:raise ConsoleError('NO_PATH',f'无法到达航点 {i+1}')
-            output.extend(position(v.pose) for v in result.result.path.poses)
+        goals=automatic_goals(points,pose,mode)
+        route=prune_reached_goals(goals+([goals[0]] if mode=='loop' else []),pose,.4)
+        if not route:raise ConsoleError('NO_PATH','起点已覆盖全部航点，请调整航点或先移动小车',409)
+        req=ComputePathThroughPoses.Goal();req.goals=[self.pose_msg(p) for p in route]
+        req.planner_id='GridBased';req.use_start=False
+        handle=await ros_future(self.planner.send_goal_async(req))
+        if not handle.accepted:raise ConsoleError('PLAN_REJECTED','路径规划被拒绝')
+        try:result=await ros_future(handle.get_result_async(),max(20,min(120,6*len(route))))
+        except BaseException:
+            handle.cancel_goal_async();raise
+        if result.status!=4 or not result.result.path.poses:
+            with self.lock:near=points_within(self.scan_points,pose,.40)
+            hint='，起点附近有障碍（雷达点过近），请把小车移开一点或清理代价地图后重试' if near>=6 else '，请调整航点位置'
+            raise ConsoleError('NO_PATH','无可行的连续前向路径'+hint,409)
+        output=[position(v.pose) for v in result.result.path.poses]
         with self.lock:self.plan=output[::max(1,len(output)//1500)]
         return {'path':self.plan,'point_count':len(points)}
 
@@ -398,17 +437,40 @@ class RosBridge(Node):
             if not self.localized():raise ConsoleError('NOT_LOCALIZED','请先完成定位')
             if not self.nav.server_is_ready():raise ConsoleError('NAV_NOT_READY','导航服务未就绪')
             points=validate_waypoints(points,self.map_meta,self.grid,mode)
+            if start_conflict(self.map_meta,self.grid,self.pose):
+                raise ConsoleError('START_BLOCKED','当前位置与地图不符（车压在障碍或膨胀区上），请重新定位后再开始巡航',409)
+            self.navigation_goals=automatic_goals(points,self.pose,mode)
+            self.route_cursor=0
             self.epoch+=1
             self.mission={'state':'accepting','index':0,'cycle':0,'points':points,'mode':mode,'distance_remaining':None}
             self.error=None;self.publish_speed();self._send_nav(self.epoch)
             return dict(self.mission)
 
+    def _batch_goals(self,start):
+        """本次下发的目标窗口（规则见 core.plan_batch）。"""
+        return plan_batch(self.navigation_goals,start,self.mission['mode'],self.lookahead)
+
+    def _waypoint_index(self):
+        return waypoint_index(self.route_cursor,self.mission['mode'],len(self.navigation_goals))
+
     def _send_nav(self,ticket):
         if ticket!=self.epoch:return
-        m=self.mission;req=NavigateToPose.Goal();req.pose=self.pose_msg(m['points'][m['index']])
+        m=self.mission;start=self.route_cursor
+        route=self._batch_goals(start)
+        if not route:
+            with self.lock:
+                m['index']=self._waypoint_index();m['state']='completed';m['distance_remaining']=0.
+            return
+        req=NavigateThroughPoses.Goal();req.poses=[self.pose_msg(p) for p in route]
+        count=len(req.poses)
         def feedback(msg):
-            if ticket==self.epoch:
-                with self.lock:self.mission['distance_remaining']=msg.feedback.distance_remaining
+            with self.lock:
+                if ticket!=self.epoch:return
+                remaining=int(msg.feedback.number_of_poses_remaining)
+                if 1<=remaining<=count:
+                    self.route_cursor=max(self.route_cursor,start+count-remaining)
+                    m['index']=self._waypoint_index()
+                m['distance_remaining']=remaining_route_distance(self.navigation_goals,start,count,m['mode'],msg.feedback.distance_remaining)
         f=self.nav.send_goal_async(req,feedback_callback=feedback);self.pending_goal=f
         def accepted(f):
             try:handle=f.result()
@@ -433,11 +495,23 @@ class RosBridge(Node):
             except Exception:status=6
             if status!=4:
                 self.mission['state']='failed';self.error='导航未完成';return
-            self.mission['index']+=1
-            if self.mission['index']>=len(self.mission['points']):
-                if self.mission['mode']=='loop':self.mission['index']=0;self.mission['cycle']+=1
-                else:self.mission['state']='completed';return
-            self._send_nav(ticket)
+            self.pending_goal=None
+            # 一批可能覆盖多个航点：整批走完才推进游标
+            start=self.route_cursor
+            count=max(1,len(self._batch_goals(start)))
+            self.route_cursor=start+count
+            n=len(self.navigation_goals)
+            m=self.mission
+            if m['mode']=='loop':
+                m['cycle']=lap_number(self.route_cursor,n)
+                m['index']=self._waypoint_index()
+                self._send_nav(ticket)
+            elif self.route_cursor>=n:
+                self.route_cursor=n;m['index']=max(0,n-1)
+                m['state']='completed';m['distance_remaining']=0.
+            else:
+                m['index']=self._waypoint_index()
+                self._send_nav(ticket)
 
     async def stop(self,pause=False):
         async with self.cancel_lock:

@@ -38,6 +38,15 @@ class APITests(unittest.IsolatedAsyncioTestCase):
  async def post(self,path,data,headers=None):
   r=await self.client.post('/api/'+path,json=data,headers=headers if headers is not None else self.headers)
   return r.status,await r.json()
+ async def test_environment_reset_preserves_maps_and_routes(self):
+  before=self.console.maps.list();self.console.routes=[{'id':'keep'}]
+  self.console.bridge.error='old failure';self.console.active_map_id=before[0]['id']
+  status,result=await self.post('control/reset',{})
+  self.assertEqual(status,200);self.assertEqual(self.console.bridge.mode,'idle')
+  self.assertEqual(self.console.bridge.mission['state'],'idle');self.assertIsNone(self.console.active_map_id)
+  self.assertIsNone(self.console.bridge.error);self.assertEqual(self.console.routes,[{'id':'keep'}])
+  self.assertTrue(set(x['id'] for x in before).issubset(x['id'] for x in self.console.maps.list()))
+  self.assertIsNotNone(result['backup'])
  async def test_auth_and_origin(self):
   self.assertEqual((await self.post('navigation/speed',{'speed_mps':.2},{}))[0],403)
   self.assertEqual((await self.post('navigation/speed',{'speed_mps':.2},{**self.headers,'Origin':'http://evil.invalid'}))[0],403)

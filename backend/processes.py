@@ -63,12 +63,13 @@ class Processes:
             except (ProcessLookupError,FileNotFoundError):pass
         deadline=time.monotonic()+12
         while self.existing_launches() and time.monotonic()<deadline:await asyncio.sleep(.15)
-        names={'wheeltec_robot_node','lslidar_driver_node','ekf_node','slam_gmapping'}
+        names={'wheeltec_robot_node','lslidar_driver_node','ekf_node','slam_gmapping','amcl','controller_server','planner_server'}
         remaining=[]
         for d in Path('/proc').glob('[0-9]*'):
             try:
-                first=(d/'cmdline').read_bytes().split(b'\0')[0].decode()
-                if Path(first).name in names:remaining.append(d.name)
+                if d.stat().st_uid!=os.getuid():continue
+                args=(d/'cmdline').read_bytes().decode().split('\0');first=args[0]
+                if Path(first).name in names or (Path(first).name=='component_container_isolated' and '__node:=nav2_container' in args):remaining.append(d.name)
             except (OSError,UnicodeError):continue
         if remaining:raise ConsoleError('PROCESS_CONFLICT','旧 ROS 进程未退出：'+','.join(remaining))
 

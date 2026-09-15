@@ -17,6 +17,7 @@ import psutil
 import yaml
 from core import ConsoleError,MapStore,finite,pose_arg,validate_waypoints,map_image
 from processes import Processes
+from navigation_profile import apply_forward_profile
 from uplink import Uplink
 
 ROOT=Path(__file__).resolve().parent.parent
@@ -40,6 +41,9 @@ class Console:
         self.metrics={'cpu_percent':None,'memory_percent':None,'temperature_c':None};self.transition=None;self.last_error=None
         self.uplink=Uplink(self.config,self.snapshot);self.routes_path=self.root/'runtime/routes.json'
         self.routes=json.loads(self.routes_path.read_text()) if self.routes_path.exists() else []
+        # Normalize legacy saved routes without retaining user-specified headings.
+        for route in self.routes:
+            route['points']=[{'x':p['x'],'y':p['y']} for p in route.get('points',[])]
         if simulate and not self.maps.list():self.maps.save('实验室地图',*self.bridge.snapshot_map())
         if not simulate:
             existing=self.processes.existing_launches()
@@ -158,6 +162,8 @@ class Console:
 
     async def dispatch(self,group,action,body):
         key=(group,action)
+        if key==('control','reset'):
+            return await self.reset_environment()
         if key in [('mapping','start'),('mapping','restart')]:
             if self.bridge.mode=='mapping' and action=='start':raise ConsoleError('ALREADY_MAPPING','建图已运行')
             if self.bridge.mission['state'] in ('running','accepting','paused','pausing','stopping'):raise ConsoleError('MISSION_ACTIVE','请先停止巡航')
@@ -260,6 +266,41 @@ class Console:
             except Exception as e:self.bridge.error=str(e)
         self.auto_task=asyncio.create_task(perform())
 
+    async def cancel_localization(self):
+        task=self.auto_task;self.auto_task=None
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):await task
+
+    async def reset_environment(self):
+        self.transition='reset';self.last_error=None
+        backup=None
+        try:
+            await self.cancel_localization()
+            if self.bridge.mode=='mapping' and self.bridge.map_meta:
+                backup=self.maps.save('环境重置前备份 '+time.strftime('%m-%d %H:%M'),*self.bridge.snapshot_map())
+            await self.safe_stop()
+            self.bridge.mode='idle'
+            if not self.simulate:await self.processes.stop_robot()
+            self.bridge.reset_localization();self.active_map_id=None
+            self.bridge.error=None
+            self.bridge.mission={'state':'idle','index':0,'cycle':0,'points':[],'mode':'multi','distance_remaining':None}
+            if not self.simulate:
+                self.processes.start_standby()
+                await self.wait_chassis()
+            self.last_error=None
+            return {'ok':True,'mode':'idle','backup':backup}
+        except Exception as e:
+            self.last_error=str(e);raise
+        finally:self.transition=None
+
+    async def wait_chassis(self):
+        for _ in range(80):
+            state=self.bridge.snapshot()
+            if state.get('velocity') and state.get('imu') and state.get('chassis',{}).get('state')=='online':return
+            await asyncio.sleep(.25)
+        raise ConsoleError('CHASSIS_OFFLINE','底盘里程计或 IMU 无数据，请检查底盘供电和 USB 连接',503)
+
     async def safe_stop(self,pause=False):
         try:await self.bridge.stop(pause=pause)
         except ConsoleError:
@@ -277,7 +318,7 @@ class Console:
                     lost_since=lost_since or time.monotonic()
                     if time.monotonic()-lost_since>2:
                         await self.safe_stop()
-                        self.bridge.mission['state']='failed';self.bridge.error='定位或传感器数据中断，任务已停止'
+                        self.bridge.mission['state']='failed';self.bridge.error=('底盘里程计中断' if not state['velocity'] else '雷达数据中断' if state['lidar']['state']!='online' else '地图定位失效')+'，任务已停止'
                         lost_since=None
                 else:lost_since=None
             else:lost_since=None
@@ -286,20 +327,27 @@ class Console:
     async def switch_mode(self,mode,item=None):
         self.transition=mode;self.last_error=None
         try:
+            await self.cancel_localization()
             await self.safe_stop()
+            self.active_map_id=None
             if not self.simulate:
                 params=None
                 if mode=='navigation':
                     source=Path(self.config['workspace'])/'install/wheeltec_nav2/share/wheeltec_nav2/param/wheeltec_params/param_mini_akm.yaml'
-                    cfg=yaml.safe_load(source.read_text());amcl=cfg['amcl']['ros__parameters'];amcl['set_initial_pose']=False
+                    cfg=apply_forward_profile(yaml.safe_load(source.read_text()),self.root);amcl=cfg['amcl']['ros__parameters'];amcl['set_initial_pose']=False
                     params=self.root/'runtime/navigation.yaml';params.write_text(yaml.safe_dump(cfg,sort_keys=False))
                 await self.processes.stop_robot()
                 self.bridge.reset_localization();self.bridge.mode='idle'
                 await self.processes.launch_robot(mode,self.maps.directory(item['id'])/'map.yaml' if item else None,params)
             else:self.bridge.reset_localization()
             self.bridge.mode=mode;self.bridge.started_at=time.time()
+            if not self.simulate:await self.wait_chassis()
             if mode=='mapping':self.active_map_id=None
-        except Exception as e:self.last_error=str(e);self.bridge.mode='idle';raise
+        except Exception as e:
+            self.last_error=str(e);self.bridge.mode='idle'
+            if not self.simulate:
+                await self.processes.stop_robot();self.processes.start_standby()
+            raise
         finally:self.transition=None
 
     async def stream(self,req):

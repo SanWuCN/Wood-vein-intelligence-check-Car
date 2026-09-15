@@ -42,6 +42,9 @@ def cell_to_world(meta, x, y):
     return o['x']+math.cos(a)*gx-math.sin(a)*gy, o['y']+math.sin(a)*gx+math.cos(a)*gy
 
 
+MIN_WAYPOINT_SPACING = 0.5
+
+
 def validate_waypoints(points, meta, grid, mode='multi'):
     if mode not in ('single', 'multi', 'loop'):
         raise ConsoleError('INVALID_MODE', '巡航模式无效', 422)
@@ -51,7 +54,10 @@ def validate_waypoints(points, meta, grid, mode='multi'):
         raise ConsoleError('INVALID_WAYPOINTS', '航点数量与巡航模式不符', 422)
     if meta is None or grid is None:
         raise ConsoleError('MAP_UNAVAILABLE', '地图未就绪')
-    result = [pose_arg(p) for p in points]
+    result = []
+    for p in points:
+        if not isinstance(p, dict):raise ConsoleError('INVALID_WAYPOINTS', '航点必须为坐标对象', 422)
+        result.append({'x':finite(p.get('x'),'x',-100000,100000), 'y':finite(p.get('y'),'y',-100000,100000)})
     for p in result:
         x, y = world_to_cell(meta, p['x'], p['y'])
         if not (0 <= x < meta['width'] and 0 <= y < meta['height']):
@@ -59,6 +65,38 @@ def validate_waypoints(points, meta, grid, mode='multi'):
         v = int(grid[y, x])
         if v < 0 or v > 20:
             raise ConsoleError('POINT_BLOCKED', '航点位于障碍物或未知区域', 422)
+    # 相邻航点（循环含闭合段）必须拉开距离：太近时连续导航窗口的终点会落在车位上，
+    # 控制器每个周期都拿路径终点与车位比较，会立刻判为到达并跳过后续航点。
+    pairs = list(zip(range(len(result)), result, result[1:] + ([result[0]] if mode == 'loop' and len(result) > 1 else [])))
+    for i, a, b in pairs:
+        if math.hypot(b['x'] - a['x'], b['y'] - a['y']) < MIN_WAYPOINT_SPACING:
+            raise ConsoleError('POINTS_TOO_CLOSE', f'相邻航点 {i+1} 与 {(i+1) % len(result)+1} 距离需 ≥{MIN_WAYPOINT_SPACING:g} m', 422)
+    return result
+
+
+def automatic_goals(points, start, mode='multi'):
+    """Resolve position-only waypoints to internal Dubins goals.
+
+    Corner headings bisect incoming/outgoing travel directions; endpoints follow
+    their adjacent segment. Nav2 then finds collision-free, curvature-bounded arcs.
+    Legacy yaw values are deliberately ignored. This is not a minimum-path proof.
+    """
+    result=[]
+    for i,p in enumerate(points):
+        prev=points[i-1] if i else (points[-1] if mode=='loop' else start)
+        nxt=points[i+1] if i+1<len(points) else (points[0] if mode=='loop' else None)
+        directions=[]
+        for a,b in ((prev,p),(p,nxt)):
+            if a is None or b is None:continue
+            dx=b['x']-a['x'];dy=b['y']-a['y'];length=math.hypot(dx,dy)
+            if length>1e-6:directions.append((dx/length,dy/length))
+        if not directions:
+            angle=(start or {}).get('yaw',0.)
+        else:
+            x=sum(d[0] for d in directions);y=sum(d[1] for d in directions)
+            if math.hypot(x,y)<1e-6:x,y=directions[-1]
+            angle=math.atan2(y,x)
+        result.append({'x':p['x'],'y':p['y'],'yaw':angle})
     return result
 
 
@@ -260,3 +298,85 @@ def idle_refine_decision(state, now):
     match = state.get('match')
     if match is not None and match < state.get('match_min', .35): return False, 'match_low'
     return True, 'ok'
+
+
+def remaining_route_distance(goals, cursor, count, mode, path_remaining):
+    """剩余总里程估算 = 当前窗口剩余路径 + 之后各航点之间的直线距离。
+
+    连续巡航分批下发目标，动作反馈里的 distance_remaining 只覆盖当前窗口，
+    这里补上后续航点，界面显示的“剩余距离”才代表整条路线。"""
+    n = len(goals)
+    if not n: return 0.
+    total = float(path_remaining or 0.)
+    if mode == 'loop':
+        # 含回到本圈起点的闭合段：循环任务的“剩余”是本圈剩余里程
+        rest = [goals[(cursor + count + i) % n] for i in range(max(0, n - count) + 1)]
+    else:
+        rest = goals[cursor + count:]
+    prev = goals[(cursor + count - 1) % n]
+    for point in rest:
+        total += math.hypot(point['x'] - prev['x'], point['y'] - prev['y'])
+        prev = point
+    return round(total, 2)
+
+
+def plan_batch(goals, cursor, mode, lookahead):
+    """连续巡航的单批目标窗口。
+
+    - multi/single：线性推进，lookahead=0 表示把剩余航点一次下发完
+    - loop：按环状滚动取点，且窗口必须小于一圈
+    窗口小于一圈这一点是硬性要求：控制器每个周期都拿**路径终点**与车位比较，
+    若终点正好是车位（循环闭合处）就会被立刻判为到达，任务空转。
+    """
+    n = len(goals)
+    if not n: return []
+    if mode == 'loop':
+        count = min(lookahead or max(1, n - 1), max(1, n - 1))
+        return [goals[(cursor + i) % n] for i in range(count)]
+    count = min(lookahead or (n - cursor), n - cursor)
+    return goals[cursor:cursor + max(0, count)]
+
+
+def waypoint_index(cursor, mode, total):
+    """当前正在驶向的航点序号（界面显示用）。"""
+    if total <= 0: return 0
+    return cursor % total if mode == 'loop' else min(cursor, total - 1)
+
+
+def lap_number(cursor, total):
+    """按已走过的航点段数推算圈数。"""
+    return cursor // total if total > 0 else 0
+
+
+def prune_reached_goals(goals, pose, radius=.4):
+    """去掉开头几个已经在车位容差内的目标。
+
+    Nav2 的连续规划是“从起点依次串到各目标”，若第一个目标与起点重合，
+    规划器会直接失败（实测 status=ABORTED、0 路径点）。执行时行为树里的
+    RemovePassedGoals 会先剪枝，但预览是裸调用规划动作，需要自己剪。"""
+    if pose is None: return list(goals)
+    kept = list(goals)
+    while kept and math.hypot(kept[0]['x'] - pose['x'], kept[0]['y'] - pose['y']) <= radius:
+        kept.pop(0)
+    return kept
+
+
+def start_conflict(meta, grid, pose, margin=.25):
+    """车位是否压在障碍或内切膨胀区上。
+
+    这种时候规划器会以“Starting point in lethal space”失败，界面只看到“无可行路径”，
+    因此提前判定并给出可执行的提示（重新定位或把车移开）。"""
+    if meta is None or grid is None or not pose: return False
+    radius = max(1, int(margin / meta['resolution']))
+    cx, cy = world_to_cell(meta, pose['x'], pose['y'])
+    x0, x1 = max(0, cx - radius), min(meta['width'], cx + radius + 1)
+    y0, y1 = max(0, cy - radius), min(meta['height'], cy + radius + 1)
+    if x0 >= x1 or y0 >= y1: return False
+    return bool(np.any(grid[y0:y1, x0:x1] > 65))
+
+
+def points_within(points, pose, radius):
+    """车位 radius 范围内的雷达点数：用于判断小车是否被障碍贴住（此时规划必失败）。"""
+    if not points or not pose: return 0
+    r2 = radius * radius
+    return sum(1 for p in points if (p[0] - pose['x']) ** 2 + (p[1] - pose['y']) ** 2 <= r2)
