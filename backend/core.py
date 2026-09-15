@@ -42,7 +42,7 @@ def cell_to_world(meta, x, y):
     return o['x']+math.cos(a)*gx-math.sin(a)*gy, o['y']+math.sin(a)*gx+math.cos(a)*gy
 
 
-MIN_WAYPOINT_SPACING = 0.3
+MIN_WAYPOINT_SPACING = 0.02
 
 
 def validate_waypoints(points, meta, grid, mode='multi'):
@@ -320,22 +320,56 @@ def remaining_route_distance(goals, cursor, count, mode, path_remaining):
     return round(total, 2)
 
 
-def plan_batch(goals, cursor, mode, lookahead):
+def plan_batch(goals, cursor, mode, lookahead, min_length_m=0., max_points=0):
     """连续巡航的单批目标窗口。
 
     - multi/single：线性推进，lookahead=0 表示把剩余航点一次下发完
     - loop：按环状滚动取点，且窗口必须小于一圈
-    窗口小于一圈这一点是硬性要求：控制器每个周期都拿**路径终点**与车位比较，
+    窗口小于一圈是硬性要求：控制器每个周期都拿**路径终点**与车位比较，
     若终点正好是车位（循环闭合处）就会被立刻判为到达，任务空转。
-    """
+
+    min_length_m/max_points 用于密集航点（遥控录制每 10 cm 一个点）：
+    先按点数取，再按累计长度补足到 min_length_m，最后受 max_points 限制——
+    否则 10 cm 的点会让“看 4 个点”只覆盖 40 cm，既看不到前面也没法连续行驶。"""
     n = len(goals)
     if not n: return []
     if mode == 'loop':
-        count = min(lookahead or max(1, n - 1), max(1, n - 1))
-        return [goals[(cursor + i) % n] for i in range(count)]
-    count = min(lookahead or (n - cursor), n - cursor)
+        limit = max(1, n - 1)
+        count = min(lookahead or limit, limit)
+    else:
+        limit = max(0, n - cursor)
+        count = min(lookahead or limit, limit)
+    if count and min_length_m > 0:
+        def segment(i):
+            a = goals[(cursor + i) % n] if mode == 'loop' else goals[cursor + i]
+            b = goals[(cursor + i + 1) % n] if mode == 'loop' else goals[cursor + i + 1]
+            return math.hypot(b['x'] - a['x'], b['y'] - a['y'])
+        travelled = sum(segment(i) for i in range(count - 1))
+        index = count
+        while index < limit and travelled < min_length_m:   # 航点密集时按距离补足
+            travelled += segment(index - 1)
+            index += 1
+        count = index
+    if max_points:
+        count = min(count, max(1, max_points), limit)
+    if mode == 'loop': return [goals[(cursor + i) % n] for i in range(count)]
     return goals[cursor:cursor + max(0, count)]
 
+
+def missed_waypoint(robot, target, direction, arrival_radius, min_beyond=.05):
+    """航点是否已被“越过”而应当跳过。
+
+    点密集时（录制每 10 cm 一个点）到达半径只能取很小，偶尔会擦肩而过；
+    若还要求绕回该点就会兜圈子。判据：车已越过该点所在的横截面
+    （沿路线方向投影 > min_beyond），且横向距离已超过到达半径。"""
+    if not robot or not target or not direction: return False
+    dx, dy = robot['x'] - target['x'], robot['y'] - target['y']
+    length = math.hypot(dx, dy)
+    if length <= max(arrival_radius, .02): return False
+    nx, ny = float(direction[0]), float(direction[1])
+    norm = math.hypot(nx, ny)
+    if norm < 1e-9: return False
+    return (dx * nx + dy * ny) / norm > min_beyond
 
 def waypoint_index(cursor, mode, total):
     """当前正在驶向的航点序号（界面显示用）。"""

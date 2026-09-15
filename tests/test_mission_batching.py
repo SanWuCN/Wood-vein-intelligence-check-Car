@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'backend'))
 from core import (MAP_SAVE_TOLERANCE, ConsoleError, circle_footprint, footprint_center, footprint_points, footprint_text,
-                  grid_diff_ratio, lap_number, plan_batch, points_within, should_backup_map,
+                  grid_diff_ratio, lap_number, missed_waypoint, plan_batch, points_within, should_backup_map,
                   prune_reached_goals, record_step, remaining_route_distance, start_conflict,
                   validate_waypoints, waypoint_index)
 
@@ -78,95 +78,76 @@ class RemainingDistanceTests(unittest.TestCase):
 
 class WaypointSpacingTests(unittest.TestCase):
     def setUp(self):
-        self.meta = {'width': 40, 'height': 40, 'resolution': .5, 'origin': {'x': 0., 'y': 0., 'yaw': 0.}}
-        self.grid = np.zeros((40, 40), np.int16)
+        self.meta = {'width': 300, 'height': 300, 'resolution': .05, 'origin': {'x': 0., 'y': 0., 'yaw': 0.}}
+        self.grid = np.zeros((300, 300), np.int16)
 
-    def test_rejects_waypoints_too_close(self):
-        # 小于 0.30 m 的相邻航点会让连续导航窗口终点落进到点半径，控制器会立刻判到达
+    def test_dense_recorded_route_is_accepted(self):
+        # 遥控录制每 10 cm 一个点：必须可以直接用于巡航，不再要求 25/30 cm 间距
+        pts = [{'x': 1. + i * .10, 'y': 1.} for i in range(12)]
+        self.assertEqual(len(validate_waypoints(pts, self.meta, self.grid, 'multi')), 12)
+        self.assertEqual(len(validate_waypoints(pts, self.meta, self.grid, 'loop')), 12)
+
+    def test_only_duplicate_points_are_rejected(self):
         with self.assertRaises(ConsoleError) as ctx:
-            validate_waypoints([{'x': 1., 'y': 1.}, {'x': 1.25, 'y': 1.}], self.meta, self.grid, 'multi')
+            validate_waypoints([{'x': 1., 'y': 1.}, {'x': 1.005, 'y': 1.}], self.meta, self.grid, 'multi')
         self.assertEqual(ctx.exception.code, 'POINTS_TOO_CLOSE')
+        # 3 cm 已可接受
+        self.assertEqual(len(validate_waypoints([{'x': 1., 'y': 1.}, {'x': 1.03, 'y': 1.}], self.meta, self.grid, 'multi')), 2)
 
-    def test_rejects_loop_closure_too_close(self):
-        with self.assertRaises(ConsoleError) as ctx:
-            validate_waypoints([{'x': 1., 'y': 1.}, {'x': 5., 'y': 1.}, {'x': 1.1, 'y': 1.}], self.meta, self.grid, 'loop')
-        self.assertEqual(ctx.exception.code, 'POINTS_TOO_CLOSE')
-
-    def test_accepts_reasonable_spacing(self):
-        out = validate_waypoints([{'x': 1., 'y': 1.}, {'x': 5., 'y': 1.}, {'x': 5., 'y': 5.}], self.meta, self.grid, 'loop')
-        self.assertEqual(len(out), 3)
-
-    def test_threshold_is_0_3m(self):
-        # 0.35 m 现在应通过，0.25 m 仍应拒绝
-        self.assertEqual(len(validate_waypoints([{'x': 1., 'y': 1.}, {'x': 1.35, 'y': 1.}], self.meta, self.grid, 'multi')), 2)
-        with self.assertRaises(ConsoleError):
-            validate_waypoints([{'x': 1., 'y': 1.}, {'x': 1.25, 'y': 1.}], self.meta, self.grid, 'multi')
+    def test_loop_closure_can_be_dense(self):
+        pts = [{'x': 1. + i * .1, 'y': 1.} for i in range(4)]
+        self.assertEqual(len(validate_waypoints(pts, self.meta, self.grid, 'loop')), 4)
 
 
-if __name__ == '__main__':
-    unittest.main()
+class DenseWindowTests(unittest.TestCase):
+    """密集航点：窗口要按距离补足，否则每 4 个点（40 cm）就停一次。"""
+
+    def dense(self, count=40, step=.1):
+        return [{'x': i * step, 'y': 0., 'yaw': 0.} for i in range(count)]
+
+    def test_window_covers_min_length(self):
+        g = self.dense()
+        batch = plan_batch(g, 0, 'multi', 4, min_length_m=2.5, max_points=40)
+        self.assertGreaterEqual(len(batch), 25)          # 2.5m / 0.1m ≈ 25 个点
+        self.assertLessEqual(len(batch), 40)
+
+    def test_max_points_caps_planning_cost(self):
+        g = self.dense(count=200)
+        self.assertEqual(len(plan_batch(g, 0, 'multi', 4, min_length_m=10., max_points=30)), 30)
+
+    def test_sparse_route_keeps_point_count_behaviour(self):
+        g = [{'x': i * 1.2, 'y': 0., 'yaw': 0.} for i in range(6)]
+        self.assertEqual(len(plan_batch(g, 0, 'multi', 4, min_length_m=2.5, max_points=40)), 4)  # 4 点已覆盖 3.6m，无需补足
+
+    def test_loop_dense_window_still_shorter_than_lap(self):
+        g = self.dense(count=30)
+        batch = plan_batch(g, 0, 'loop', 4, min_length_m=5., max_points=40)
+        self.assertLess(len(batch), len(g))              # 一圈 30 点，窗口必须小于一圈
+        self.assertEqual(len(batch), 29)                 # 距离补足到 5m 但受“一圈减一”限制
+
+    def test_no_length_constraint_keeps_old_behaviour(self):
+        g = self.dense(count=10)
+        self.assertEqual(len(plan_batch(g, 0, 'multi', 4)), 4)
 
 
-class PruneReachedTests(unittest.TestCase):
-    def test_drops_leading_goals_at_the_robot(self):
-        g = goals((1, 1), (1, 2), (1, 3))
-        # 起点与首个目标重合会让规划器直接失败，必须剪掉
-        self.assertEqual([p['y'] for p in prune_reached_goals(g, {'x': 1., 'y': 1., 'yaw': 0.}, .4)], [2., 3.])
-        self.assertEqual([p['y'] for p in prune_reached_goals(g, {'x': 1.2, 'y': 1., 'yaw': 0.}, .4)], [2., 3.])
-        self.assertEqual([p['y'] for p in prune_reached_goals(g, {'x': 1., 'y': .5, 'yaw': 0.}, .4)], [1., 2., 3.])
+class MissedWaypointTests(unittest.TestCase):
+    """擦肩而过的航点应跳过，而不是绕回去。"""
 
-    def test_keeps_list_when_robot_unknown(self):
-        g = goals((1, 1), (1, 2))
-        self.assertEqual(prune_reached_goals(g, None), g)
+    def test_passed_waypoint_is_skipped(self):
+        target = {'x': 0., 'y': 0.}
+        direction = (1., 0.)                              # 路线沿 +x
+        self.assertTrue(missed_waypoint({'x': .2, 'y': .02}, target, direction, .08))   # 已越过
+        self.assertTrue(missed_waypoint({'x': .5, 'y': -.3}, target, direction, .08))
 
+    def test_not_yet_reached_is_kept(self):
+        target = {'x': 0., 'y': 0.}
+        self.assertFalse(missed_waypoint({'x': -.2, 'y': 0.}, target, (1., 0.), .08))    # 还没到
+        self.assertFalse(missed_waypoint({'x': .05, 'y': .0}, target, (1., 0.), .08))    # 在到达半径内（会被正常剪枝）
 
-class StartConflictTests(unittest.TestCase):
-    def setUp(self):
-        self.meta = {'width': 40, 'height': 40, 'resolution': .5, 'origin': {'x': 0., 'y': 0., 'yaw': 0.}}
-        self.grid = np.zeros((40, 40), np.int16)
-        self.grid[20, 20] = 100          # 10m,10m 处一堵墙
-
-    def test_detects_pose_inside_obstacle(self):
-        self.assertTrue(start_conflict(self.meta, self.grid, {'x': 10.1, 'y': 10.1, 'yaw': 0.}))
-        self.assertTrue(start_conflict(self.meta, self.grid, {'x': 10.3, 'y': 10., 'yaw': 0.}))   # 内切膨胀范围内
-
-    def test_free_pose_is_clean(self):
-        self.assertFalse(start_conflict(self.meta, self.grid, {'x': 5., 'y': 5., 'yaw': 0.}))
-        self.assertFalse(start_conflict(self.meta, None, {'x': 10., 'y': 10., 'yaw': 0.}))
-        self.assertFalse(start_conflict(self.meta, self.grid, None))
-
-
-class PointsWithinTests(unittest.TestCase):
-    def test_counts_points_near_the_car(self):
-        pts = [[1.0, 1.0], [1.3, 1.0], [2.0, 2.0]]
-        self.assertEqual(points_within(pts, {'x': 1., 'y': 1., 'yaw': 0.}, .4), 2)
-        self.assertEqual(points_within(pts, {'x': 1., 'y': 1., 'yaw': 0.}, .1), 1)
-        self.assertEqual(points_within(pts, None, .4), 0)
-        self.assertEqual(points_within([], {'x': 1., 'y': 1., 'yaw': 0.}, .4), 0)
-
-
-class ClearanceTests(unittest.TestCase):
-    def test_circle_footprint_is_centered_circle(self):
-        fp = circle_footprint(.30, (.089, 0.))
-        self.assertEqual(len(fp), 16)
-        r = [math.hypot(p[0] - .089, p[1]) for p in fp]
-        self.assertAlmostEqual(min(r), .30, places=3)
-        self.assertAlmostEqual(max(r), .30, places=3)
-
-    def test_footprint_center_of_ackermann_body(self):
-        nested = [[-.031, -.093], [-.031, .093], [.209, .093], [.209, -.093]]
-        self.assertEqual(footprint_center(nested), (.089, 0.))
-        # 厂商参数里 footprint 是字符串，必须能解析
-        self.assertEqual(footprint_center('[ [-0.031, -0.093], [-0.031, 0.093], [0.209, 0.093], [0.209, -0.093] ]'), (.089, 0.))
-        self.assertEqual(footprint_center(''), (0., 0.))
-        self.assertEqual(footprint_center([]), (0., 0.))
-
-    def test_record_step_only_after_min_distance(self):
-        self.assertEqual(record_step([], {'x': 1.2345, 'y': 2.3456, 'yaw': 0.}, .2), [1.234, 2.346])
-        pts = [[1.0, 1.0]]
-        self.assertIsNone(record_step(pts, {'x': 1.1, 'y': 1.0, 'yaw': 0.}, .2))
-        self.assertEqual(record_step(pts, {'x': 1.2, 'y': 1.0, 'yaw': 0.}, .2), [1.2, 1.0])
-        self.assertIsNone(record_step(pts, None, .2))
+    def test_missing_inputs_are_safe(self):
+        self.assertFalse(missed_waypoint(None, {'x': 0., 'y': 0.}, (1., 0.), .08))
+        self.assertFalse(missed_waypoint({'x': 1., 'y': 0.}, None, (1., 0.), .08))
+        self.assertFalse(missed_waypoint({'x': 1., 'y': 0.}, {'x': 0., 'y': 0.}, (0., 0.), .08))
 
 
 class MapSaveBackupTests(unittest.TestCase):

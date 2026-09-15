@@ -39,6 +39,7 @@ class ContinuousTests(unittest.TestCase):
    return done(handle)
   pts=points or [(1,0),(2,1),(3,1)]
   b=NS(epoch=2,lock=threading.RLock(),route_cursor=0,pose_msg=pose,goal_handle=None,pending_goal=None,lookahead=lookahead,
+       lookahead_m=0.,lookahead_max=0,skip_missed=False,_skipping=False,_last_skip_at=0.,
        mission={'state':'accepting','index':0,'cycle':0,'mode':mode,'points':[{'x':x,'y':y} for x,y in pts]},
        navigation_goals=goals_of(pts),error=None,nav=NS(send_goal_async=send))
   b._finished=lambda f,t:RosBridge._finished(b,f,t)

@@ -25,7 +25,7 @@ from lifecycle_msgs.msg import State
 from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 from cv_bridge import CvBridge
 import cv2
-from core import (ConsoleError, automatic_goals, bounds, grid_likelihood, idle_refine_decision, lap_number,
+from core import (ConsoleError, automatic_goals, bounds, grid_likelihood, idle_refine_decision, lap_number, missed_waypoint,
                     map_image, plan_batch, points_within, prune_reached_goals, record_step, remaining_route_distance, start_conflict,
                     validate_waypoints, waypoint_index,
                     world_to_cell, snap_pose as core_snap_pose)
@@ -62,7 +62,12 @@ class RosBridge(Node):
         self.speed=config['default_speed_mps'];self.cv=CvBridge();self._camera_encode_at=0
         # 连续巡航：每批下发的目标点数（0=mult 全部剩余 / loop 一圈减一段）
         self.lookahead=int(config.get('cruise_lookahead',4) or 0)
-        self.arrival_radius=float(config.get('cruise_arrival_radius',.25))
+        self.arrival_radius=float(config.get('cruise_arrival_radius',.08))
+        # 密集航点（录制每 10 cm 一个点）：窗口按距离补足，避免每几个点就停一次
+        self.lookahead_m=float(config.get('cruise_lookahead_m',2.5) or 0.)
+        self.lookahead_max=int(config.get('cruise_lookahead_max_points',40) or 0)
+        self.skip_missed=bool(config.get('skip_missed_points',True))
+        self._skipping=False;self._last_skip_at=0.
         self.clearance=float(config.get('cruise_clearance',.30))
         self._like=None;self._like_rev=None
         # 航迹记录（遥控教学）：每 record_step_m 米记一个点，直接可存成路线
@@ -113,6 +118,7 @@ class RosBridge(Node):
         self.view_timer=self.create_timer(.2,self.publish_view_frame)
         self.refine_timer=self.create_timer(1.,self.idle_refine_tick)
         self.record_timer=self.create_timer(.2,self.record_tick)
+        self.skip_timer=self.create_timer(.5,self.mission_skip_tick)
         self.speed_timer=self.create_timer(1.,self.publish_speed)
         self.spin_executor=MultiThreadedExecutor(num_threads=3);self.spin_executor.add_node(self)
         self.thread=threading.Thread(target=self.spin_executor.spin,daemon=True);self.thread.start()
@@ -475,13 +481,13 @@ class RosBridge(Node):
             self.navigation_goals=automatic_goals(points,self.pose,mode)
             self.route_cursor=0
             self.epoch+=1
-            self.mission={'state':'accepting','index':0,'cycle':0,'points':points,'mode':mode,'distance_remaining':None}
+            self.mission={'state':'accepting','index':0,'cycle':0,'points':points,'mode':mode,'distance_remaining':None,'skipped':0}
             self.error=None;self.publish_speed();self._send_nav(self.epoch)
             return dict(self.mission)
 
     def _batch_goals(self,start):
         """本次下发的目标窗口（规则见 core.plan_batch）。"""
-        return plan_batch(self.navigation_goals,start,self.mission['mode'],self.lookahead)
+        return plan_batch(self.navigation_goals,start,self.mission['mode'],self.lookahead,self.lookahead_m,self.lookahead_max)
 
     def _waypoint_index(self):
         return waypoint_index(self.route_cursor,self.mission['mode'],len(self.navigation_goals))
@@ -520,6 +526,29 @@ class RosBridge(Node):
             handle.get_result_async().add_done_callback(lambda f:self._finished(f,ticket))
         f.add_done_callback(accepted)
 
+    def mission_skip_tick(self):
+        """目标航点已被越过却没进到达半径（点密集时常见）：跳过它，去下一个点修正。
+
+        直接取消当前动作会短暂减速，但比让规划器绕回身后的点兜一大圈好得多。
+        取消结果由 _finished 接住（status≠4 且 _skipping=True）后从下一个点续跑。"""
+        if not self.skip_missed:return
+        with self.lock:
+            if self._skipping or self.mission['state'] not in ('running','accepting'):return
+            if not self.goal_handle or time.time()-self._last_skip_at<1.:return
+            pose=self.pose if time.time()-self.pose_at<1. else None
+            goals=self.navigation_goals;n=len(goals)
+            if not pose or not n:return
+            loop=self.mission['mode']=='loop'
+            index=self.route_cursor%n if loop else min(self.route_cursor,n-1)
+            target=goals[index]
+            prev=goals[(index-1)%n] if loop else (goals[index-1] if index else None)
+            direction=(target['x']-prev['x'],target['y']-prev['y']) if prev else None
+            if not missed_waypoint(pose,target,direction,self.arrival_radius):return
+            self._skipping=True;self._last_skip_at=time.time();handle=self.goal_handle
+        try:handle.cancel_goal_async()
+        except Exception:
+            with self.lock:self._skipping=False
+
     def _finished(self,f,ticket):
         with self.lock:
             if ticket!=self.epoch:return
@@ -527,6 +556,14 @@ class RosBridge(Node):
             try:status=f.result().status
             except Exception:status=6
             if status!=4:
+                if self._skipping:
+                    # 主动跳过被越过的航点：推进游标后从下一个点续跑
+                    self._skipping=False
+                    self.goal_handle=None;self.pending_goal=None;self.route_cursor+=1
+                    self.mission['skipped']=self.mission.get('skipped',0)+1
+                    self.mission['index']=self._waypoint_index();self.mission['state']='accepting'
+                    self._send_nav(self.epoch)
+                    return
                 self.mission['state']='failed';self.error='导航未完成';return
             self.pending_goal=None
             # 一批可能覆盖多个航点：整批走完才推进游标
