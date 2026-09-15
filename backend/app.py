@@ -15,7 +15,7 @@ import aiohttp
 from aiohttp import web
 import psutil
 import yaml
-from core import ConsoleError,MapStore,finite,pose_arg,validate_waypoints,map_image
+from core import ConsoleError,MAP_SAVE_TOLERANCE,MapStore,finite,grid_diff_ratio,pose_arg,should_backup_map,validate_waypoints,map_image
 from processes import Processes
 from navigation_profile import apply_forward_profile
 from uplink import Uplink
@@ -37,7 +37,7 @@ class Console:
             from ros_bridge import RosBridge
             self.bridge=RosBridge(self.config)
         self.maps=MapStore(self.root/'runtime/maps');self.processes=Processes(self.root,self.config)
-        self.active_map_id=None;self.auto_task=None;self.tasks=[];self.media=None;self.command_lock=asyncio.Lock();self.idempotency=collections.OrderedDict()
+        self.active_map_id=None;self.mapping_saved_grid=None;self.mapping_saved_name=None;self._mapping_status=None;self._mapping_status_rev=None;self.auto_task=None;self.tasks=[];self.media=None;self.command_lock=asyncio.Lock();self.idempotency=collections.OrderedDict()
         self.metrics={'cpu_percent':None,'memory_percent':None,'temperature_c':None};self.transition=None;self.last_error=None
         self.uplink=Uplink(self.config,self.snapshot);self.routes_path=self.root/'runtime/routes.json'
         self.routes=json.loads(self.routes_path.read_text()) if self.routes_path.exists() else []
@@ -96,11 +96,30 @@ class Console:
         local=req.remote in ('127.0.0.1','::1')
         return web.json_response({'token':self.config['control_token'] if local else None,'can_control':local,'device_id':self.config['device_id'],'max_speed_mps':self.config['max_speed_mps']})
     async def state(self,req):return web.json_response(self.snapshot())
+    def mapping_status(self):
+        """当前建图相对上次保存是否有实质改动（按栅格差异比例）。
+
+        这个函数在每次状态推送时都会调用，任何异常都不能把 /api/state 带崩。"""
+        try:return self._mapping_status_impl()
+        except Exception:return {'saved':False,'changed':True,'diff_ratio':1.,'saved_name':None}
+
+    def _mapping_status_impl(self):
+        with self.bridge.lock:grid=self.bridge.grid;rev=getattr(self.bridge,'map_revision',None)
+        if self.mapping_saved_grid is None:
+            return {'saved':False,'changed':bool(grid is not None),'diff_ratio':1. if grid is not None else 0.,'saved_name':None}
+        if grid is None:
+            return {'saved':True,'changed':False,'diff_ratio':0.,'saved_name':self.mapping_saved_name}
+        if rev==self._mapping_status_rev and self._mapping_status:return self._mapping_status
+        ratio=grid_diff_ratio(self.mapping_saved_grid,grid)
+        self._mapping_status={'saved':True,'changed':ratio>MAP_SAVE_TOLERANCE,'diff_ratio':round(ratio,4),'saved_name':self.mapping_saved_name}
+        self._mapping_status_rev=rev
+        return self._mapping_status
+
     def snapshot(self):
         state=self.bridge.snapshot()
         state.update({'schema_version':'1.0','device_id':self.config['device_id'],'sampled_at':time.time(),'simulated':self.simulate,'metrics':dict(self.metrics),'active_map_id':self.active_map_id,'transition':self.transition,'max_speed_mps':self.config['max_speed_mps'],
                       'platform':{'state':self.uplink.state,'last_success':self.uplink.last_success,'error':self.uplink.error},
-                      'streams':{'rviz':'/api/streams/rviz.mjpeg','camera':'/api/streams/camera.mjpeg','rviz_state':('online' if self.media and time.time()-self.media.rviz_at<3 else 'offline'),'rtmp':self.media.rtmp if self.media else {}},'last_error':self.last_error})
+                      'mapping':self.mapping_status(),'streams':{'rviz':'/api/streams/rviz.mjpeg','camera':'/api/streams/camera.mjpeg','rviz_state':('online' if self.media and time.time()-self.media.rviz_at<3 else 'offline'),'rtmp':self.media.rtmp if self.media else {}},'last_error':self.last_error})
         return state
 
     async def websocket(self,req):
@@ -170,25 +189,35 @@ class Console:
             backup=None
             if self.bridge.mode=='mapping' and self.bridge.map_meta:
                 backup=self.maps.save('自动备份 '+time.strftime('%m-%d %H:%M'),*self.bridge.snapshot_map())
+            self.mapping_saved_grid=None;self.mapping_saved_name=None;self._mapping_status=None
             await self.switch_mode('mapping');return {'ok':True,'mode':'mapping','backup':backup}
         if key==('mapping','save'):
-            item=self.maps.save(body.get('name'),*self.bridge.snapshot_map());return {'ok':True,'map':item}
+            item=self.maps.save(body.get('name'),*self.bridge.snapshot_map())
+            with self.bridge.lock:self.mapping_saved_grid=self.bridge.grid.copy() if self.bridge.grid is not None else None
+            self.mapping_saved_name=item['name'];self._mapping_status=None
+            return {'ok':True,'map':item}
         if key==('mapping','stop'):
             await self.safe_stop()
             if not self.simulate:await self.processes.stop_robot()
+            self.mapping_saved_grid=None;self.mapping_saved_name=None;self._mapping_status=None
             self.bridge.mode='idle'
             if not self.simulate:self.processes.start_standby()
             return {'ok':True,'mode':'idle'}
         if key==('navigation','load'):
             if self.bridge.mission['state'] in ('running','accepting','paused','pausing','stopping'):raise ConsoleError('MISSION_ACTIVE','请先停止巡航')
             item,grid=self.maps.load(body.get('map_id'))
-            if self.bridge.mode=='mapping' and self.bridge.map_meta:self.maps.save('切换前备份 '+time.strftime('%m-%d %H:%M'),*self.bridge.snapshot_map())
+            backup=None
+            if self.bridge.mode=='mapping' and self.bridge.map_meta:
+                status=self.mapping_status()
+                if should_backup_map(body.get('save_current'),status['saved'],status['diff_ratio']):
+                    backup=self.maps.save('切换前备份 '+time.strftime('%m-%d %H:%M'),*self.bridge.snapshot_map())
+            self.mapping_saved_grid=None;self.mapping_saved_name=None;self._mapping_status=None
             await self.switch_mode('navigation',item)
             self.active_map_id=item['id']
             if self.simulate:
                 self.bridge.map_meta=item['map'];self.bridge.grid=grid;self.bridge.map_png=map_image(grid)
             self.start_auto_localize()
-            return {'ok':True,'map':item,'localization':'pending'}
+            return {'ok':True,'map':item,'localization':'pending','backup':backup}
         if key==('navigation','auto-localize'):
             if self.bridge.mode!='navigation':raise ConsoleError('NOT_NAVIGATING','请先加载巡航地图')
             if self.bridge.mission['state'] in ('running','accepting','paused','pausing','stopping'):raise ConsoleError('MISSION_ACTIVE','请先停止巡航')

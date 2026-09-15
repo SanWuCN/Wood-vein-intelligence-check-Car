@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'backend'))
-from core import (ConsoleError, circle_footprint, footprint_center, footprint_points, footprint_text, lap_number, plan_batch, points_within,
+from core import (MAP_SAVE_TOLERANCE, ConsoleError, circle_footprint, footprint_center, footprint_points, footprint_text,
+                  grid_diff_ratio, lap_number, plan_batch, points_within, should_backup_map,
                   prune_reached_goals, record_step, remaining_route_distance, start_conflict,
                   validate_waypoints, waypoint_index)
 
@@ -166,3 +167,39 @@ class ClearanceTests(unittest.TestCase):
         self.assertIsNone(record_step(pts, {'x': 1.1, 'y': 1.0, 'yaw': 0.}, .2))
         self.assertEqual(record_step(pts, {'x': 1.2, 'y': 1.0, 'yaw': 0.}, .2), [1.2, 1.0])
         self.assertIsNone(record_step(pts, None, .2))
+
+
+class MapSaveBackupTests(unittest.TestCase):
+    """切换地图时是否还要自动备份当前建图。"""
+
+    def test_same_grid_is_not_backed_up_again(self):
+        import numpy as np
+        g = np.zeros((40, 40), np.int16)
+        self.assertEqual(grid_diff_ratio(g, g.copy()), 0.)
+        self.assertFalse(should_backup_map(None, True, 0.))
+        self.assertFalse(should_backup_map(None, True, MAP_SAVE_TOLERANCE))
+
+    def test_real_changes_trigger_backup(self):
+        import numpy as np
+        before = np.zeros((40, 40), np.int16)
+        after = before.copy(); after[10:20, 10:20] = 100      # 改动 6.25% 栅格
+        ratio = grid_diff_ratio(before, after)
+        self.assertGreater(ratio, MAP_SAVE_TOLERANCE)
+        self.assertTrue(should_backup_map(None, True, ratio))
+
+    def test_explicit_choices_win(self):
+        self.assertFalse(should_backup_map(False, False, 1.))   # 明确不保存
+        self.assertTrue(should_backup_map(True, True, 0.))      # 明确保存
+        self.assertTrue(should_backup_map(None, False, 0.))     # 从没保存过 → 自动备份
+
+    def test_shape_change_counts_as_fully_different(self):
+        import numpy as np
+        self.assertEqual(grid_diff_ratio(np.zeros((4, 4), np.int16), np.zeros((5, 5), np.int16)), 1.)
+        self.assertEqual(grid_diff_ratio(None, np.zeros((4, 4), np.int16)), 1.)
+
+    def test_small_scan_noise_is_tolerated(self):
+        import numpy as np
+        before = np.zeros((200, 200), np.int16)
+        after = before.copy(); after[0, :3] = 100                # 3/40000 = 0.0075%
+        self.assertLess(grid_diff_ratio(before, after), MAP_SAVE_TOLERANCE)
+        self.assertFalse(should_backup_map(None, True, grid_diff_ratio(before, after)))

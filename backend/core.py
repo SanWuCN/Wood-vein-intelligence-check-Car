@@ -425,3 +425,25 @@ def record_step(points, pose, step):
         lx, ly = points[-1][0], points[-1][1]
         if math.hypot(x - lx, y - ly) < step - 1e-9: return None   # 恰好等于步长也应记录
     return [x, y]
+
+
+MAP_SAVE_TOLERANCE = 0.01
+
+
+def grid_diff_ratio(before, after):
+    """两张占据栅格的不同栅格占比（0–1）；形状不同视为完全不同。"""
+    if before is None or after is None: return 1.
+    if before.shape != after.shape: return 1.
+    if before.size == 0: return 0.
+    return float(np.count_nonzero(before != after)) / float(before.size)
+
+
+def should_backup_map(save_current, saved, diff_ratio, tolerance=MAP_SAVE_TOLERANCE):
+    """切换地图时是否需要自动备份当前建图。
+
+    save_current: True=强制备份，False=不备份，None=自动判断。
+    自动判断下，只要上次保存之后地图没有实质变化（差异 ≤ tolerance）就不再备份、不再打扰用户。"""
+    if save_current is False: return False
+    if save_current is True: return True
+    if not saved: return True
+    return diff_ratio > tolerance
