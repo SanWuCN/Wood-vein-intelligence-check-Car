@@ -656,3 +656,12 @@ def chassis_restart_decision(down_since, now, last_restart, down_after_s=8., coo
     if now - down_since < down_after_s: return False, 'waiting'
     if now - (last_restart or 0.) < cooldown_s: return False, 'cooldown'
     return True, 'restart'
+
+
+def missing_chassis_parts(state):
+    """启动底盘相关功能前，列出到底缺哪一路数据（用于给出准确提示）。"""
+    gaps = []
+    if not state.get('velocity'): gaps.append('里程计 /odom')
+    if not state.get('imu'): gaps.append('IMU /imu/data_raw')
+    if (state.get('chassis') or {}).get('state') != 'online': gaps.append('底盘原始数据')
+    return gaps

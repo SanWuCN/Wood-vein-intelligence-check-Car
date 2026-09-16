@@ -16,7 +16,7 @@ import aiohttp
 from aiohttp import web
 import psutil
 import yaml
-from core import ConsoleError,MAP_SAVE_TOLERANCE,MapStore,chassis_restart_decision,finite,grid_diff_ratio,infeasible_turn_ratio,path_min_radius,pose_arg,should_backup_map,simplify_path,validate_waypoints,map_image
+from core import ConsoleError,MAP_SAVE_TOLERANCE,MapStore,chassis_restart_decision,finite,missing_chassis_parts,grid_diff_ratio,infeasible_turn_ratio,path_min_radius,pose_arg,should_backup_map,simplify_path,validate_waypoints,map_image
 from processes import Processes
 from navigation_profile import apply_forward_profile
 from uplink import Uplink
@@ -360,12 +360,27 @@ class Console:
             self.last_error=str(e);raise
         finally:self.transition=None
 
-    async def wait_chassis(self):
-        for _ in range(80):
-            state=self.bridge.snapshot()
-            if state.get('velocity') and state.get('imu') and state.get('chassis',{}).get('state')=='online':return
+    async def wait_chassis(self,timeout_s=45.):
+        """等底盘数据就绪。
+
+        串口偶发掉线时驱动会退出、十几秒后自己或被守护拉起，原先只等 20 s 就报死，
+        还把原因一概说成"供电/USB"。现在等更久、缺哪路说哪路，并且一直没动静就主动重启一次底盘。"""
+        deadline=time.monotonic()+timeout_s
+        restarted_at=0.
+        gaps=['底盘']
+        while time.monotonic()<deadline:
+            gaps=missing_chassis_parts(self.bridge.snapshot())
+            if not gaps:
+                if (self.last_error or '').startswith('底盘'):self.last_error=None   # 恢复后不要挂着旧报错
+                return
+            now=time.monotonic()
+            if self.bridge.mode=='idle' and now-restarted_at>25:
+                restarted_at=now
+                try:
+                    await self.processes.stop_robot();self.processes.start_standby()
+                except Exception:pass
             await asyncio.sleep(.25)
-        raise ConsoleError('CHASSIS_OFFLINE','底盘里程计或 IMU 无数据，请检查底盘供电和 USB 连接',503)
+        raise ConsoleError('CHASSIS_OFFLINE',f"底盘数据未就绪（缺少：{'、'.join(gaps)}），已尝试自动重启；请检查串口线/USB 与底盘供电后再试",503)
 
     async def safe_stop(self,pause=False):
         try:await self.bridge.stop(pause=pause)

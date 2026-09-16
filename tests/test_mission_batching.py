@@ -7,6 +7,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'backend'))
 from core import (MAP_SAVE_TOLERANCE, ConsoleError, aruco_consistent, aruco_jump_ok, chassis_restart_decision, circle_footprint, compose_pose,
                   footprint_center, footprint_points, footprint_text, invert_pose, marker_pose_from_robot,
+                  missing_chassis_parts,
                   grid_diff_ratio, infeasible_turn_ratio, lap_number, missed_waypoint, path_min_radius, plan_batch,
                   plan_leads_away, points_within, relocalize_decision, robot_pose_from_marker, should_backup_map,
                   simplify_path, stalled_here,
@@ -360,3 +361,18 @@ class ChassisGuardTests(unittest.TestCase):
 
     def test_healthy_chassis_is_noop(self):
         self.assertEqual(chassis_restart_decision(None, 120., 0.), (False, 'ok'))
+
+
+class ChassisGapTests(unittest.TestCase):
+    """启动前检查：缺哪路数据就说哪路，别一概归到供电/USB。"""
+
+    def test_reports_each_missing_part(self):
+        self.assertEqual(missing_chassis_parts({'velocity': {'linear_mps': 0.}, 'imu': {'roll_deg': 0.},
+                                                'chassis': {'state': 'online'}}), [])
+        self.assertEqual(missing_chassis_parts({'velocity': None, 'imu': {'roll_deg': 0.},
+                                                'chassis': {'state': 'online'}}), ['里程计 /odom'])
+        self.assertEqual(missing_chassis_parts({'velocity': {'linear_mps': 0.}, 'imu': None,
+                                                'chassis': {'state': 'online'}}), ['IMU /imu/data_raw'])
+        self.assertEqual(missing_chassis_parts({'velocity': None, 'imu': None, 'chassis': {'state': 'offline'}}),
+                         ['里程计 /odom', 'IMU /imu/data_raw', '底盘原始数据'])
+        self.assertEqual(len(missing_chassis_parts({})), 3)
