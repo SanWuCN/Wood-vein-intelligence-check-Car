@@ -55,6 +55,8 @@ class Processes:
     async def stop_robot(self):
         await self.stop('standby')
         await self.stop('robot')
+        await self.stop('lidar')
+        await self.stop('slam')
         # Adopt only known, user-owned ROS launch entry points, never arbitrary programs.
         existing=self.existing_launches()
         for pid,_,_ in existing:
@@ -90,8 +92,17 @@ class Processes:
                 'scan_topic':'scan','particles':60,'delta':0.05,'linearUpdate':0.2,'angularUpdate':0.2,
                 'temporalUpdate':0.5,'resampleThreshold':0.5,'maxUrange':11.5,'minimumScore':30.0,
                 'xmin':-20.0,'xmax':20.0,'ymin':-20.0,'ymax':20.0}}},sort_keys=False))
-            args=['ros2','run','slam_gmapping','slam_gmapping','--ros-args','--params-file',str(params_path)]
-        else:args=['ros2','launch','wheeltec_nav2','wheeltec_nav2.launch.py','map:='+str(map_yaml),'params:='+str(params)]
+            # 厂商 slam_gmapping.launch.py 里带底盘+EKF+雷达，不能只起 gmapping 节点，
+            # 否则点“开始建图”后底盘就没了（里程计/IMU/cmd_vel 全断）。这里按同样组合分别起：
+            # 底盘+EKF、雷达、以及带自定义参数的 gmapping 节点。
+            robot=self.spawn('robot',['ros2','launch','turn_on_wheeltec_robot','turn_on_wheeltec_robot.launch.py'])
+            self.spawn('lidar',['ros2','launch','turn_on_wheeltec_robot','wheeltec_lidar.launch.py'])
+            await asyncio.sleep(1.5)
+            self.spawn('slam',['ros2','run','slam_gmapping','slam_gmapping','--ros-args','--params-file',str(params_path)])
+            await asyncio.sleep(2)
+            if robot.poll() is not None:raise ConsoleError('LAUNCH_FAILED','ROS 启动失败，请查看运行日志')
+            return
+        args=['ros2','launch','wheeltec_nav2','wheeltec_nav2.launch.py','map:='+str(map_yaml),'params:='+str(params)]
         p=self.spawn('robot',args)
         await asyncio.sleep(2)
         if p.poll() is not None:raise ConsoleError('LAUNCH_FAILED','ROS 启动失败，请查看运行日志')
