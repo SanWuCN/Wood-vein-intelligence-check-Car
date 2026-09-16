@@ -4,6 +4,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
+import yaml
 from core import ConsoleError
 
 
@@ -46,7 +47,7 @@ class Processes:
                     if Path(a).name=='ros2' and args[i+1:i+2]==['launch']:
                         package=args[i+2] if len(args)>i+2 else ''
                         launch=args[i+3] if len(args)>i+3 else ''
-                        if (package,launch) in [('slam_gmapping','slam_gmapping.launch.py'),('wheeltec_nav2','wheeltec_nav2.launch.py'),('turn_on_wheeltec_robot','turn_on_wheeltec_robot.launch.py'),('turn_on_wheeltec_robot','wheeltec_lidar.launch.py')]:
+                        if (package,launch) in [('slam_gmapping','slam_gmapping.launch.py'),('slam_gmapping','slam_gmapping'),('wheeltec_nav2','wheeltec_nav2.launch.py'),('turn_on_wheeltec_robot','turn_on_wheeltec_robot.launch.py'),('turn_on_wheeltec_robot','wheeltec_lidar.launch.py')]:
                             found.append((int(d.name),package,launch))
             except (OSError,UnicodeError):continue
         return found
@@ -79,7 +80,17 @@ class Processes:
 
     async def launch_robot(self,mode,map_yaml=None,params=None):
         await self.stop_robot()
-        if mode=='mapping':args=['ros2','launch','slam_gmapping','slam_gmapping.launch.py']
+        if mode=='mapping':
+            # 默认参数（linearUpdate=1.0、particles=30）建出来的图会畸变，
+            # 用显式参数文件起节点，走 20 cm 就处理一帧、粒子 60。
+            params_path=self.root/'runtime'/'gmapping.yaml'
+            params_path.parent.mkdir(parents=True,exist_ok=True)
+            params_path.write_text(yaml.safe_dump({'slam_gmapping':{'ros__parameters':{
+                'use_sim_time':False,'base_frame':'base_footprint','odom_frame':'odom_combined','map_frame':'map',
+                'scan_topic':'scan','particles':60,'delta':0.05,'linearUpdate':0.2,'angularUpdate':0.2,
+                'temporalUpdate':0.5,'resampleThreshold':0.5,'maxUrange':11.5,'minimumScore':30.0,
+                'xmin':-20.0,'xmax':20.0,'ymin':-20.0,'ymax':20.0}}},sort_keys=False))
+            args=['ros2','run','slam_gmapping','slam_gmapping','--ros-args','--params-file',str(params_path)]
         else:args=['ros2','launch','wheeltec_nav2','wheeltec_nav2.launch.py','map:='+str(map_yaml),'params:='+str(params)]
         p=self.spawn('robot',args)
         await asyncio.sleep(2)

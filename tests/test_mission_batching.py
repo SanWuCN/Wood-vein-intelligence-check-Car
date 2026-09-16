@@ -5,9 +5,11 @@ import unittest
 from pathlib import Path
 import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'backend'))
-from core import (MAP_SAVE_TOLERANCE, ConsoleError, circle_footprint, footprint_center, footprint_points, footprint_text,
+from core import (MAP_SAVE_TOLERANCE, ConsoleError, aruco_consistent, aruco_jump_ok, chassis_restart_decision, circle_footprint, compose_pose,
+                  footprint_center, footprint_points, footprint_text, invert_pose, marker_pose_from_robot,
                   grid_diff_ratio, infeasible_turn_ratio, lap_number, missed_waypoint, path_min_radius, plan_batch,
-                  plan_leads_away, points_within, relocalize_decision, should_backup_map, simplify_path, stalled_here,
+                  plan_leads_away, points_within, relocalize_decision, robot_pose_from_marker, should_backup_map,
+                  simplify_path, stalled_here,
                   prune_reached_goals, record_step, remaining_route_distance, start_conflict,
                   validate_waypoints, waypoint_index)
 
@@ -305,3 +307,56 @@ class SkipCirclingTests(unittest.TestCase):
         self.assertFalse(stalled_here(ref, {'x': 1.01, 'y': 1.01, 'speed': 0.}, 1.))   # 时间不够
         self.assertFalse(stalled_here(ref, {'x': 1.4, 'y': 1.0, 'speed': 0.}, 3.))     # 已经走开了
         self.assertFalse(stalled_here(ref, {'x': 1.01, 'y': 1.01, 'speed': .2}, 3.))   # 还在动
+
+
+class ArucoLocalizationTests(unittest.TestCase):
+    """相机 ArUco 标签绝对定位：位姿复合/反算/守卫。"""
+
+    def test_pose_roundtrip(self):
+        a = {'x': 1.5, 'y': -0.7, 'yaw': .6}
+        self.assertAlmostEqual(compose_pose(a, invert_pose(a))['x'], 0., places=9)
+        self.assertAlmostEqual(compose_pose(a, invert_pose(a))['yaw'], 0., places=9)
+
+    def test_robot_pose_from_marker_matches_calibration(self):
+        # 标定得到的标签地图位姿，与"看到标签"推出的车位姿必须自洽
+        robot = {'x': 2.0, 'y': 1.0, 'yaw': math.radians(30.)}
+        marker_in_robot = {'x': 1.2, 'y': 0.05, 'yaw': math.radians(180.)}
+        marker_in_map = marker_pose_from_robot(robot, marker_in_robot)
+        back = robot_pose_from_marker(marker_in_map, marker_in_robot)
+        self.assertAlmostEqual(back['x'], robot['x'], places=9)
+        self.assertAlmostEqual(back['y'], robot['y'], places=9)
+        self.assertAlmostEqual(back['yaw'], robot['yaw'], places=9)
+
+    def test_correction_rejects_big_jumps(self):
+        current = {'x': 0., 'y': 0., 'yaw': 0.}
+        self.assertTrue(aruco_jump_ok(current, {'x': .4, 'y': .2, 'yaw': .1}, .8))
+        self.assertFalse(aruco_jump_ok(current, {'x': 2.0, 'y': 0., 'yaw': 0.}, .8))
+        self.assertFalse(aruco_jump_ok(None, {'x': 0., 'y': 0., 'yaw': 0.}))
+
+    def test_consistency_filter(self):
+        prev = {'x': 1., 'y': 1., 'yaw': .2}
+        self.assertTrue(aruco_consistent(prev, {'x': 1.05, 'y': 1.02, 'yaw': .22}))
+        self.assertFalse(aruco_consistent(prev, {'x': 1.4, 'y': 1., 'yaw': .2}))
+        self.assertFalse(aruco_consistent(prev, {'x': 1., 'y': 1., 'yaw': .9}))
+        self.assertFalse(aruco_consistent(None, prev))
+
+    def test_missing_inputs(self):
+        self.assertIsNone(robot_pose_from_marker(None, {'x': 1, 'y': 0, 'yaw': 0}))
+        self.assertIsNone(marker_pose_from_robot({'x': 0, 'y': 0, 'yaw': 0}, None))
+
+
+class ChassisGuardTests(unittest.TestCase):
+    """底盘串口掉线（驱动进程退出）时的自动重启判定。"""
+
+    def test_restarts_after_sustained_loss(self):
+        self.assertEqual(chassis_restart_decision(100., 120., 0.), (True, 'restart'))
+
+    def test_waits_before_declaring_loss(self):
+        self.assertEqual(chassis_restart_decision(115., 120., 0.), (False, 'waiting'))
+
+    def test_respects_cooldown(self):
+        self.assertEqual(chassis_restart_decision(100., 120., 110.), (False, 'cooldown'))
+        self.assertEqual(chassis_restart_decision(100., 145., 110.), (True, 'restart'))
+
+    def test_healthy_chassis_is_noop(self):
+        self.assertEqual(chassis_restart_decision(None, 120., 0.), (False, 'ok'))

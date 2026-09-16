@@ -45,6 +45,18 @@ def apply_forward_profile(cfg,root,arrival_radius=.25,clearance=.30):
         layer['enabled']=True
         layer['inflation_radius']=round(clearance*1.5,2)
         layer.setdefault('cost_scaling_factor',3.0)
+    # AMCL：默认参数在这个场地上偏保守——走 25 cm 才更新一次、自恢复被关死（收敛到错位置就回不来）
+    amcl=cfg.setdefault('amcl',{}).setdefault('ros__parameters',{})
+    amcl.setdefault('scan_topic','scan')
+    amcl['update_min_d']=0.10        # 由 0.25 收紧：走 10 cm 就更新一次滤波器
+    amcl['update_min_a']=0.10        # 由 0.20 收紧
+    amcl['max_particles']=3000       # 由 2000 提高，转弯/遮挡时更稳
+    amcl['recovery_alpha_slow']=0.001   # 打开自恢复：粒子跑偏后能重新撒开
+    amcl['recovery_alpha_fast']=0.1
+    amcl['max_beams']=120            # 由 60 提高：似然场用更多光束
+    amcl['laser_max_range']=11.5     # 比雷达量程略小，超过的读数按无效丢弃（默认 100 会把"无回波"当有效）
+    amcl['laser_model_type']='likelihood_field'
+    amcl['laser_likelihood_max_dist']=2.0
     goal_checker=cfg['controller_server']['ros__parameters'].setdefault('goal_checker',{})
     goal_checker.update({'xy_goal_tolerance':arrival_radius,'yaw_goal_tolerance':3.141592653589793,'stateful':True})
     controller.setdefault('GoalAngleCritic',{})['enabled']=False

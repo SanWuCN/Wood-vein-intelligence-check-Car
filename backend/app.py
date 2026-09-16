@@ -16,7 +16,7 @@ import aiohttp
 from aiohttp import web
 import psutil
 import yaml
-from core import ConsoleError,MAP_SAVE_TOLERANCE,MapStore,finite,grid_diff_ratio,infeasible_turn_ratio,path_min_radius,pose_arg,should_backup_map,simplify_path,validate_waypoints,map_image
+from core import ConsoleError,MAP_SAVE_TOLERANCE,MapStore,chassis_restart_decision,finite,grid_diff_ratio,infeasible_turn_ratio,path_min_radius,pose_arg,should_backup_map,simplify_path,validate_waypoints,map_image
 from processes import Processes
 from navigation_profile import apply_forward_profile
 from uplink import Uplink
@@ -38,7 +38,7 @@ class Console:
             from ros_bridge import RosBridge
             self.bridge=RosBridge(self.config)
         self.maps=MapStore(self.root/'runtime/maps');self.processes=Processes(self.root,self.config)
-        self._build=None;self._build_stamp=None;self.active_map_id=None;self.mapping_saved_grid=None;self.mapping_saved_name=None;self._mapping_status=None;self._mapping_status_rev=None;self.auto_task=None;self.tasks=[];self.media=None;self.command_lock=asyncio.Lock();self.idempotency=collections.OrderedDict()
+        self._build=None;self._build_stamp=None;self._chassis_down_since=None;self._chassis_restart_at=0.;self.active_map_id=None;self.mapping_saved_grid=None;self.mapping_saved_name=None;self._mapping_status=None;self._mapping_status_rev=None;self.auto_task=None;self.tasks=[];self.media=None;self.command_lock=asyncio.Lock();self.idempotency=collections.OrderedDict()
         self.metrics={'cpu_percent':None,'memory_percent':None,'temperature_c':None};self.transition=None;self.last_error=None
         self.uplink=Uplink(self.config,self.snapshot);self.routes_path=self.root/'runtime/routes.json'
         self.routes=json.loads(self.routes_path.read_text()) if self.routes_path.exists() else []
@@ -236,6 +236,16 @@ class Console:
             if self.bridge.mode!='navigation':raise ConsoleError('NOT_NAVIGATING','请先加载巡航地图')
             if self.bridge.mission['state'] in ('running','accepting','paused','pausing','stopping'):raise ConsoleError('MISSION_ACTIVE','请先停止巡航')
             self.start_auto_localize();return {'ok':True,'state':'localizing'}
+        if key==('aruco','capture'):
+            pose=self.bridge.aruco_capture()
+            self.config['aruco']={**(self.config.get('aruco') or {}),'marker_pose':pose}
+            self.save_config()
+            return {'ok':True,'marker_pose':pose}
+        if key==('aruco','clear'):
+            self.config['aruco']={**(self.config.get('aruco') or {}),'marker_pose':None}
+            self.save_config();self.bridge.aruco['marker_pose']=None
+            self.bridge.aruco_state.update({'configured':False,'reason':'unconfigured'})
+            return {'ok':True,'marker_pose':None}
         if key==('record','start') or key==('record','stop') or key==('record','clear'):
             return {'ok':True,'record':self.bridge.record_command(action)}
         if key==('routes','simplify'):
@@ -365,6 +375,32 @@ class Console:
             self.last_error='导航已关闭，请重新加载地图'
             if pause:raise ConsoleError('NAV_SHUTDOWN','取消未确认，导航已关闭；请重新加载地图',503)
 
+    async def chassis_guard(self):
+        """底盘驱动守护：串口掉线会让驱动进程退出，自动重启当前模式的启动文件并提示现场检查。"""
+        while True:
+            await asyncio.sleep(5)
+            try:
+                if self.simulate: continue
+                chassis=(self.bridge.snapshot().get('chassis') or {}).get('state')
+                now=time.monotonic()
+                if chassis=='online':
+                    self._chassis_down_since=None;continue
+                self._chassis_down_since=self._chassis_down_since or now
+                ok,reason=chassis_restart_decision(self._chassis_down_since,now,self._chassis_restart_at)
+                if not ok: continue
+                self._chassis_restart_at=now
+                self.last_error='底盘串口无数据（驱动可能已退出），正在自动重启底盘；请同时检查串口线/USB 与底盘供电'
+                await self.safe_stop()
+                if self.bridge.mode=='navigation' and self.active_map_id:
+                    item,_=self.maps.load(self.active_map_id)
+                    await self.switch_mode('navigation',item)
+                elif self.bridge.mode=='mapping':
+                    await self.switch_mode('mapping')
+                else:
+                    await self.processes.stop_robot();self.processes.start_standby()
+            except Exception as e:
+                self.last_error=f'底盘自动重启失败：{e}'
+
     async def watchdog(self):
         lost_since=None
         while True:
@@ -442,7 +478,7 @@ class Console:
             await asyncio.sleep(1)
 
     async def startup(self,app):
-        self.tasks.append(asyncio.create_task(self.watchdog()));self.tasks.append(asyncio.create_task(self.metrics_loop()));self.tasks.append(asyncio.create_task(self.uplink.run()))
+        self.tasks.append(asyncio.create_task(self.watchdog()));self.tasks.append(asyncio.create_task(self.chassis_guard()));self.tasks.append(asyncio.create_task(self.metrics_loop()));self.tasks.append(asyncio.create_task(self.uplink.run()))
         if not self.simulate:
             if self.bridge.mode=='idle':self.processes.start_standby()
             from media import Media
@@ -456,6 +492,14 @@ class Console:
             self.tasks.append(asyncio.create_task(start_media()))
             if self.config['camera_auto_start']:
                 self.processes.spawn('camera',['ros2','launch','astra_camera','astra.launch.xml','enable_d2c_viewer:=false','enable_point_cloud:=false','enable_depth:=false','enable_ir:=false'])
+            aruco=self.config.get('aruco') or {}
+            if aruco.get('enabled',False):      # 需要贴 ArUco 标签，默认关闭
+                # 相机绝对定位：检测指定 ArUco 标签（Astra RGB），发布 base_footprint→marker 的 TF
+                self.processes.spawn('aruco',['ros2','launch','aruco_ros','single.launch.py',
+                                              f"marker_id:={aruco.get('marker_id',582)}",
+                                              f"marker_size:={aruco.get('marker_size_m',.1)}",
+                                              f"marker_frame:={aruco.get('frame','console_marker')}",
+                                              "reference_frame:=base_footprint","eye:=left"])
 
     async def cleanup(self,app):
         if self.auto_task:self.auto_task.cancel()

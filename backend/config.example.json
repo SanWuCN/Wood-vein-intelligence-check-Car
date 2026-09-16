@@ -32,5 +32,14 @@
   "refine_idle_shift_m": 0.18,
   "refine_idle_yaw_deg": 6,
   "cruise_lookahead": 4,
-  "cruise_arrival_radius": 0.25
+  "cruise_arrival_radius": 0.25,
+  "aruco": {
+    "enabled": false,
+    "marker_id": 582,
+    "marker_size_m": 0.1,
+    "frame": "console_marker",
+    "max_jump_m": 0.8,
+    "confirm_frames": 3,
+    "marker_pose": null
+  }
 }

@@ -602,3 +602,57 @@ def stalled_here(previous, robot, seconds, limit_s=2.5, move_m=.05, still_mps=.0
     if not robot or not previous or seconds < limit_s: return False
     speed = abs(robot.get('speed') or 0.)
     return speed <= still_mps and math.hypot(robot['x'] - previous[0], robot['y'] - previous[1]) <= move_m
+
+
+# ---- 相机（ArUco 标签）绝对定位校正 ----------------------------------------
+def normalize_yaw(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def compose_pose(a, b):
+    """位姿复合 a ∘ b（先 b 后 a），全部在 2D 平面内。"""
+    ca, sa = math.cos(a['yaw']), math.sin(a['yaw'])
+    return {'x': a['x'] + ca * b['x'] - sa * b['y'],
+            'y': a['y'] + sa * b['x'] + ca * b['y'],
+            'yaw': normalize_yaw(a['yaw'] + b['yaw'])}
+
+
+def invert_pose(p):
+    c, s = math.cos(p['yaw']), math.sin(p['yaw'])
+    return {'x': -(c * p['x'] + s * p['y']), 'y': -(-s * p['x'] + c * p['y']), 'yaw': normalize_yaw(-p['yaw'])}
+
+
+def robot_pose_from_marker(marker_in_map, marker_in_robot):
+    """相机看到标签（标签在车体坐标系的位姿）→ 车在地图中的位姿。"""
+    if not marker_in_map or not marker_in_robot: return None
+    return compose_pose(marker_in_map, invert_pose(marker_in_robot))
+
+
+def marker_pose_from_robot(robot_in_map, marker_in_robot):
+    """标定：已知当前车在地图中的位姿 + 标签相对车体的位姿 → 标签在地图中的位姿。"""
+    if not robot_in_map or not marker_in_robot: return None
+    return compose_pose(robot_in_map, marker_in_robot)
+
+
+def aruco_jump_ok(current, candidate, max_jump=.8):
+    """标签算出来的位姿与当前belief差太多就丢弃（防止误识别把车拽飞）。"""
+    if not current or not candidate: return False
+    return math.hypot(candidate['x'] - current['x'], candidate['y'] - current['y']) <= max_jump
+
+
+def aruco_consistent(previous, candidate, tolerance=.15):
+    """连续多帧是否一致：位置接近且朝向接近（用于剔除跳变）。"""
+    if not previous or not candidate: return False
+    return (math.hypot(candidate['x'] - previous['x'], candidate['y'] - previous['y']) <= tolerance and
+            abs(normalize_yaw(candidate['yaw'] - previous['yaw'])) <= math.radians(10.))
+
+
+def chassis_restart_decision(down_since, now, last_restart, down_after_s=8., cooldown_s=30.):
+    """底盘驱动守护判定：连续 down_after_s 秒没有底盘数据、且距上次重启超过 cooldown_s 才动作。
+
+    串口掉线会让 wheeltec_robot 进程直接退出（SerialException），此后里程计、IMU、
+    电池电压全无，cmd_vel 也发不出去——表现就是"定位乱飘 + 车不动"。"""
+    if down_since is None: return False, 'ok'
+    if now - down_since < down_after_s: return False, 'waiting'
+    if now - (last_restart or 0.) < cooldown_s: return False, 'cooldown'
+    return True, 'restart'

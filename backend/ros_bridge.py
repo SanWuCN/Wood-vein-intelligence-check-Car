@@ -26,7 +26,8 @@ from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 from cv_bridge import CvBridge
 import cv2
 from core import (ConsoleError, automatic_goals, bounds, grid_likelihood, idle_refine_decision, lap_number, missed_waypoint,
-                  plan_leads_away, relocalize_decision, stalled_here,
+                  aruco_consistent, aruco_jump_ok, marker_pose_from_robot, plan_leads_away, relocalize_decision,
+                  robot_pose_from_marker, stalled_here,
                     map_image, plan_batch, points_within, prune_reached_goals, record_step, remaining_route_distance, start_conflict,
                     validate_waypoints, waypoint_index,
                     world_to_cell, snap_pose as core_snap_pose)
@@ -74,6 +75,15 @@ class RosBridge(Node):
         self.skip_stall=float(config.get('cruise_skip_stall_s',2.5))
         self.skip_detour=float(config.get('cruise_skip_detour_deg',120.))
         self._stall_ref=None;self._stall_since=None
+        # 相机（ArUco 标签）绝对定位校正：看到已知位置的标签就把车拽回绝对位姿
+        aruco=dict(config.get('aruco') or {})
+        self.aruco={'enabled':bool(aruco.get('enabled',True)),'marker_id':aruco.get('marker_id',582),
+                    'frame':aruco.get('frame','console_marker'),'max_jump':float(aruco.get('max_jump_m',.8)),
+                    'confirm_frames':int(aruco.get('confirm_frames',3)),'marker_pose':aruco.get('marker_pose')}
+        self.aruco_state={'enabled':self.aruco['enabled'],'configured':bool(self.aruco['marker_pose']),'seeing':False,
+                          'count':0,'reason':'disabled' if not self.aruco['enabled'] else ('unconfigured' if not self.aruco['marker_pose'] else 'waiting'),
+                          'marker_id':self.aruco['marker_id'],'shift_m':None,'shift_deg':None,'at':None}
+        self._aruco_seen=None;self._aruco_streak=0;self._aruco_last_at=0.
         # 航行中定位守护：吻合度持续偏低时小窗口吸附重锚，连续失败则安全停车
         self.relocalize_enabled=bool(config.get('cruise_relocalize',True))
         self.relocalize_match=float(config.get('cruise_relocalize_match',.55))
@@ -135,6 +145,7 @@ class RosBridge(Node):
         self.record_timer=self.create_timer(.2,self.record_tick)
         self.skip_timer=self.create_timer(.5,self.mission_skip_tick)
         self.relocalize_timer=self.create_timer(.5,self.mission_relocalize_tick)
+        self.aruco_timer=self.create_timer(.5,self.aruco_tick)
         self.speed_timer=self.create_timer(1.,self.publish_speed)
         self.spin_executor=MultiThreadedExecutor(num_threads=3);self.spin_executor.add_node(self)
         self.thread=threading.Thread(target=self.spin_executor.spin,daemon=True);self.thread.start()
@@ -662,6 +673,60 @@ class RosBridge(Node):
                 m['index']=self._waypoint_index()
                 self._send_nav(ticket)
 
+    # ---- 相机 ArUco 标签定位 ----------------------------------------------
+    def aruco_tick(self):
+        """看到已知地图位姿的标签时，用相机给出绝对位姿并重锚 AMCL。
+
+        标签地图位姿由现场标定得到（把车停在能看到标签的位置点“记录标签位置”）；
+        连续 confirm_frames 帧一致、且与当前 belief 相差不超过 max_jump 才采纳。"""
+        if not self.aruco['enabled'] or not self.aruco['marker_pose']:return
+        now=time.time()
+        try:
+            tf=self.buffer.lookup_transform('base_footprint',self.aruco['frame'],Time(),timeout=Duration(seconds=.05))
+        except Exception:
+            with self.lock:
+                self.aruco_state.update({'seeing':False,'reason':'no_marker'})
+            self._aruco_streak=0;self._aruco_seen=None
+            return
+        t=tf.transform.translation;q=tf.transform.rotation
+        marker_in_robot={'x':t.x,'y':t.y,'yaw':yaw(q)}
+        with self.lock:
+            pose=self.pose if time.time()-self.pose_at<2 else None
+            candidate=robot_pose_from_marker(self.aruco['marker_pose'],marker_in_robot)
+            self.aruco_state.update({'seeing':True,'marker_in_robot':{k:round(v,3) for k,v in marker_in_robot.items()}})
+            if not candidate or not pose:
+                self.aruco_state['reason']='no_pose';return
+            if not aruco_jump_ok(pose,candidate,self.aruco['max_jump']):
+                self.aruco_state['reason']='jump_rejected';self._aruco_streak=0;return
+            if not aruco_consistent(self._aruco_seen,candidate):
+                self._aruco_seen=candidate;self._aruco_streak=1;self.aruco_state['reason']='confirming';return
+            self._aruco_seen=candidate;self._aruco_streak+=1
+            self.aruco_state['reason']='confirming'
+            if self._aruco_streak<self.aruco['confirm_frames']:return
+            if now-self._aruco_last_at<1.:return
+            self._aruco_last_at=now
+            shift=math.hypot(candidate['x']-pose['x'],candidate['y']-pose['y'])
+            if shift<.03 and abs(math.degrees(candidate['yaw']-pose['yaw']))<.5:
+                self.aruco_state['reason']='already_aligned';return
+            self.localize(candidate,covariance=(.05,.02))
+            self.aruco_state.update({'count':self.aruco_state['count']+1,'reason':'applied','at':now,
+                                     'shift_m':round(shift,3),'shift_deg':round(math.degrees(candidate['yaw']-pose['yaw']),1)})
+            self._aruco_seen=candidate;self._aruco_streak=0
+
+    def aruco_capture(self):
+        """标定：用当前 belief + 标签相对车体的位姿，反算标签在地图中的位姿。"""
+        try:
+            tf=self.buffer.lookup_transform('base_footprint',self.aruco['frame'],Time(),timeout=Duration(seconds=.05))
+        except Exception:raise ConsoleError('ARUCO_NOT_SEEN','相机现在看不到标签，请把车对准标签再记录',409)
+        t=tf.transform.translation;q=tf.transform.rotation
+        with self.lock:pose=self.pose if time.time()-self.pose_at<2 else None;match=self.match
+        if not pose:raise ConsoleError('NOT_LOCALIZED','当前没有可用位姿，请先完成定位',409)
+        if (match or 0)<.8:raise ConsoleError('LOCALIZATION_WEAK',f'当前吻合度仅 {int((match or 0)*100)}%，标定需要 ≥80%，请先确认定位准确',409)
+        marker=marker_pose_from_robot(pose,{'x':t.x,'y':t.y,'yaw':yaw(q)})
+        self.aruco['marker_pose']={'x':round(marker['x'],3),'y':round(marker['y'],3),'yaw':round(marker['yaw'],4)}
+        self.aruco_state.update({'configured':True,'reason':'configured'})
+        return dict(self.aruco['marker_pose'])
+
     async def stop(self,pause=False):
         async with self.cancel_lock:
             with self.lock:
@@ -697,7 +762,7 @@ class RosBridge(Node):
             return {'mode':self.mode,'uptime_s':int(now-self.started_at),'map':self.map_meta,
                     'pose':self.pose if now-self.pose_at<2 else None,'scan_points':self.scan_points,'path':self.plan,
                     'navigation':{'ready':self.nav.server_is_ready(),'planner_ready':self.planner.server_is_ready()},
-                    'localization':{'ready':self.localized(),'match':self.match,'refine':dict(self.refine_state),'relocalize':dict(self.relocalize_state),'amcl_received':self.amcl is not None,'match_age_s':age(self.match_at),'covariance':{'x_m2':self.amcl['covariance'][0],'y_m2':self.amcl['covariance'][7],'yaw_rad2':self.amcl['covariance'][35]} if self.amcl else None},
+                    'localization':{'ready':self.localized(),'match':self.match,'refine':dict(self.refine_state),'relocalize':dict(self.relocalize_state),'aruco':dict(self.aruco_state),'amcl_received':self.amcl is not None,'match_age_s':age(self.match_at),'covariance':{'x_m2':self.amcl['covariance'][0],'y_m2':self.amcl['covariance'][7],'yaw_rad2':self.amcl['covariance'][35]} if self.amcl else None},
                     'velocity':self.odom if now-self.odom_at<2 else None,
                     'imu':self.imu if now-self.imu_at<2 else None,'imu_history':list(self.imu_history),
                     'lidar':{'state':'online' if now-self.scan_at<2 else 'offline','hz':hz(self.scan_times) if now-self.scan_at<2 else None,'age_s':age(self.scan_at)},
