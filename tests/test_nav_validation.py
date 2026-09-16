@@ -54,12 +54,12 @@ class NavigationValidationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ConsoleError) as error:await RosBridge.preview(self.b,self.points,'multi')
         self.assertEqual(error.exception.code,'POINT_BLOCKED');self.assertEqual(self.requests,[])
     async def test_start_uses_validated_points_with_mock_sender(self):
-        result=RosBridge.start_mission(self.b,self.points,'multi')
+        result=await RosBridge.start_mission(self.b,self.points,'multi')
         self.assertEqual(result['state'],'accepting');self.assertEqual(result['points'],self.points)
         self.b._send_nav.assert_called_once_with(1);self.b.publish_speed.assert_called_once()
     async def test_start_rejects_unknown_without_dispatch(self):
         self.b.grid[1,1]=-1
-        with self.assertRaises(ConsoleError) as error:RosBridge.start_mission(self.b,self.points,'multi')
+        with self.assertRaises(ConsoleError) as error:await RosBridge.start_mission(self.b,self.points,'multi')
         self.assertEqual(error.exception.code,'POINT_BLOCKED');self.b._send_nav.assert_not_called();self.b.publish_speed.assert_not_called()
         self.assertEqual(self.b.mission['state'],'stopped')
 

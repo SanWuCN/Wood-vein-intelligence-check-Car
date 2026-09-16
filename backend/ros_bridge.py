@@ -71,8 +71,8 @@ class RosBridge(Node):
         self.skip_missed=bool(config.get('skip_missed_points',True))
         self._skipping=False;self._last_skip_at=0.
         # “兜圈就跳过”：越过、停在点旁不动、或规划一开头就朝反方向走，都直接去下一个点
-        self.skip_near=float(config.get('cruise_skip_near_m',.30))
-        self.skip_stall=float(config.get('cruise_skip_stall_s',2.5))
+        self.skip_near=float(config.get('cruise_skip_near_m',.25))
+        self.skip_stall=float(config.get('cruise_skip_stall_s',5.))
         self.skip_detour=float(config.get('cruise_skip_detour_deg',120.))
         self._stall_ref=None;self._stall_since=None
         # 相机（ArUco 标签）绝对定位校正：看到已知位置的标签就把车拽回绝对位姿
@@ -299,6 +299,45 @@ class RosBridge(Node):
         with self.lock:
             return bool(self.mode=='navigation' and self.map_meta is not None and time.time()-self.scan_at<3)
 
+    def rear_clearance(self,limit=.45):
+        """后方（±25°）最近障碍距离；没有雷达数据时返回 None（视为未知，不倒车）。"""
+        with self.lock:
+            scan=self.last_scan
+        if scan is None:return None
+        try:
+            import math as _m
+            best=None
+            angle=scan.angle_min
+            for r in scan.ranges:
+                deg=_m.degrees(angle);angle+=scan.angle_increment
+                if abs(abs(deg)-180.)>25.:continue                     # 只看正后方 ±25°
+                if r is None or r!=r or r<=0 or r>=scan.range_max:continue
+                best=r if best is None else min(best,r)
+            return best
+        except Exception:return None
+
+    async def nudge_clear_of_obstacles(self,max_bursts=14,speed=.06,burst_s=.5):
+        """起步位置太靠障碍时先倒车让出空间。
+
+        规划器遇到 "Starting point in lethal space" 会直接失败、BT 只能反复恢复，
+        表现就是"停在原地/原地磨轮子"。这里小步倒车（每步约 3 cm），
+        每步之后重新判断，直到位置可用或达到上限。"""
+        for step in range(max_bursts):
+            with self.lock:
+                pose=self.pose;meta=self.map_meta;grid=self.grid
+            if not pose or not start_conflict(meta,grid,pose,self.clearance):
+                return step
+            rear=self.rear_clearance()
+            # 倒车前必须先看后方：没有雷达数据或后方不足 0.45 m 就不倒，宁可报错让用户挪车
+            if rear is None or rear<.45:
+                self.get_logger().warning(f'后方净空不足（{rear}），放弃自动倒车让位')
+                return step
+            twist=Twist();twist.linear.x=-abs(speed)          # 阿克曼底盘支持倒车
+            for _ in range(max(1,int(burst_s*10))):
+                self.stop_pub.publish(twist);await asyncio.sleep(.1)
+            self.stop_pub.publish(Twist());await asyncio.sleep(.4)
+        return max_bursts
+
     def action_ready(self,client,name):
         """动作服务是否可用（server_is_ready 或主动 wait_for_server 探测）。
 
@@ -494,8 +533,16 @@ class RosBridge(Node):
         with self.lock:
             points=validate_waypoints(points,self.map_meta,self.grid,mode)
             pose=self.pose;meta=self.map_meta;grid=self.grid
+        nudged=0
         if start_conflict(meta,grid,pose,self.clearance):
-            raise ConsoleError('START_BLOCKED',f'当前位置离障碍不足 {self.clearance:g} m（或与地图不符），请把车移开一些再预览',409)
+            # 离墙太近 → 先倒车让位再规划（规划器无法从致命栅格起步）
+            nudged=await self.nudge_clear_of_obstacles()
+            with self.lock:pose=self.pose;meta=self.map_meta;grid=self.grid
+            if start_conflict(meta,grid,pose,self.clearance):
+                raise ConsoleError('START_BLOCKED',
+                    f'已尝试倒车让位（{nudged*3} cm）但车仍离障碍不足 {self.clearance:g} m，请手动挪车后再预览',409)
+            points=validate_waypoints(points,meta,grid,mode)
+        self.nudged_cm=nudged*3
         self.plan=[]
         # 注意：这台机器上 ROS 2 的动作发现不可靠（新建 ActionClient 的 wait_for_server 也探不到
         # /compute_path_through_poses，尽管 ros2 action list 里有）。所以不拿它当门禁，
@@ -520,14 +567,18 @@ class RosBridge(Node):
         with self.lock:self.plan=output[::max(1,len(output)//1500)]
         return {'path':self.plan,'point_count':len(points)}
 
-    def start_mission(self,points,mode):
+    async def start_mission(self,points,mode):
         with self.lock:
             if self.mission['state'] in ('running','accepting','pausing','paused','stopping'):raise ConsoleError('MISSION_ACTIVE','已有巡航任务')
             if not self.localized():raise ConsoleError('NOT_LOCALIZED','请先完成定位')
             if not self.nav.server_is_ready():raise ConsoleError('NAV_NOT_READY','导航服务未就绪')
-            points=validate_waypoints(points,self.map_meta,self.grid,mode)
+            # 先让位再校验（校验会因起点落在障碍/未知区而拒绝）
             if start_conflict(self.map_meta,self.grid,self.pose,self.clearance):
-                raise ConsoleError('START_BLOCKED',f'当前位置离障碍不足 {self.clearance:g} m（或与地图不符），请把车移开一些再开始巡航',409)
+                await self.nudge_clear_of_obstacles()
+                if start_conflict(self.map_meta,self.grid,self.pose,self.clearance):
+                    raise ConsoleError('START_BLOCKED',
+                        f'已尝试倒车让位但车仍离障碍不足 {self.clearance:g} m，请手动挪车后再开始巡航',409)
+            points=validate_waypoints(points,self.map_meta,self.grid,mode)
             self.navigation_goals=automatic_goals(points,self.pose,mode)
             self.route_cursor=0
             self.epoch+=1
@@ -587,7 +638,7 @@ class RosBridge(Node):
         if not self.skip_missed:return
         with self.lock:
             if self._skipping or self.mission['state'] not in ('running','accepting'):return
-            if not self.goal_handle or time.time()-self._last_skip_at<1.:return
+            if not self.goal_handle or time.time()-self._last_skip_at<3.:return   # 两次跳过至少隔 3 s，避免连环跳点
             pose=self.pose if time.time()-self.pose_at<1. else None
             goals=self.navigation_goals;n=len(goals)
             if not pose or not n:return
@@ -605,9 +656,8 @@ class RosBridge(Node):
             stalled=stalled_here(self._stall_ref,{'x':pose['x'],'y':pose['y'],'speed':speed},
                                  time.time()-(self._stall_since or time.time()),self.skip_stall)
             reason=None
-            if missed_waypoint(pose,target,direction,self.arrival_radius):reason='越过'
+            if missed_waypoint(pose,target,direction,max(self.arrival_radius*.5,.10)):reason='越过'
             elif stalled and distance<=self.skip_near:reason='停在点旁到不了'
-            elif plan_leads_away(plan,pose,target,min_angle_deg=self.skip_detour):reason='规划要掉头兜圈'
             if not reason:return
             self._skipping=True;self._last_skip_at=time.time()
             self.mission['skip_reason']=reason

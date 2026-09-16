@@ -13,7 +13,7 @@ class ForwardProfileTests(unittest.TestCase):
   self.assertTrue(c['PathAngleCritic']['forward_preference']);self.assertFalse(c['enforce_path_inversion'])
   bt=ET.parse(cfg['bt_navigator']['ros__parameters']['default_nav_to_pose_bt_xml']);tags={n.tag for n in bt.iter()}
   self.assertTrue({'ComputePathToPose','FollowPath','Wait','ClearEntireCostmap'}<=tags)
-  self.assertFalse(tags&{'BackUp','Spin','DriveOnHeading'})
+  self.assertFalse(tags&{'Spin','DriveOnHeading'})   # 原地旋转会造成绕圈，倒车恢复是允许的
   checker=cfg['controller_server']['ros__parameters']['goal_checker']
   # 默认到点半径 0.20（实测最小转弯半径 0.30 m）：停靠容差不小于它
   self.assertEqual(checker['xy_goal_tolerance'],.20);self.assertGreaterEqual(checker['yaw_goal_tolerance'],3.14159)
@@ -26,7 +26,7 @@ class ForwardProfileTests(unittest.TestCase):
   self.assertIsNotNone(through.find('.//ComputePathThroughPoses'))
   self.assertEqual(through.find('.//RemovePassedGoals').get('radius'),'0.2')
   self.assertIn('runtime',cfg['bt_navigator']['ros__parameters']['default_nav_through_poses_bt_xml'])
-  self.assertFalse({n.tag for n in through.iter()}&{'BackUp','Spin'})
+  self.assertFalse({n.tag for n in through.iter()}&{'Spin'})
   prior=copy.deepcopy(cfg);apply_forward_profile(cfg,root);self.assertEqual(cfg,prior)
  def test_obstacle_clearance_becomes_effective_footprint(self):
   root=Path(__file__).resolve().parents[1]
@@ -51,6 +51,17 @@ class ForwardProfileTests(unittest.TestCase):
   p=cfg['local_costmap']['local_costmap']['ros__parameters']
   xs=[q[0] for q in footprint_points(p['footprint'])]
   self.assertAlmostEqual((max(xs)-min(xs))/2,.5,places=3)
+ def test_reverse_recovery_present(self):
+  """离墙太近/规划失败时要有有界倒车恢复（BackUp），但不能有原地旋转。"""
+  root=Path(__file__).resolve().parents[1]
+  cfg={'planner_server':{'ros__parameters':{'GridBased':{}}},'controller_server':{'ros__parameters':{'FollowPath':{}}},'bt_navigator':{'ros__parameters':{}}}
+  apply_forward_profile(cfg,root)
+  bt=ET.parse(cfg['bt_navigator']['ros__parameters']['default_nav_through_poses_bt_xml'])
+  back=bt.find('.//BackUp')
+  self.assertIsNotNone(back)
+  self.assertLessEqual(float(back.get('backup_dist')),.30)     # 有界，避免倒太远
+  self.assertLessEqual(float(back.get('backup_speed')),.10)
+  self.assertIsNone(bt.find('.//Spin'))
  def test_dense_route_keeps_small_passed_radius_but_stops_comfortably(self):
   root=Path(__file__).resolve().parents[1]
   cfg={'planner_server':{'ros__parameters':{'GridBased':{}}},'controller_server':{'ros__parameters':{'FollowPath':{'critics':['GoalCritic','PathFollowCritic']}}},'bt_navigator':{'ros__parameters':{}}}

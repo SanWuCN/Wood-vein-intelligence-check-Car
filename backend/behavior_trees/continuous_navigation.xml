@@ -1,5 +1,7 @@
 <!-- Continuous position-waypoint navigation. Pass radius is rendered from cruise_arrival_radius (default 0.25 m).
-     Forward-only recovery: clear costmaps and wait; no spin or reverse. -->
+     Recovery: clear costmaps -> bounded reverse (when the robot is too close to an obstacle the planner
+     reports "Starting point in lethal space" and no path can be found) -> wait. No spin: rotation in place
+     was what made the car circle endlessly earlier. -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
     <RecoveryNode number_of_retries="6" name="NavigateRecovery">
@@ -25,7 +27,8 @@
             <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
             <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
           </Sequence>
-          <Wait wait_duration="5"/>
+          <BackUp name="BackUpRecovery" backup_dist="0.25" backup_speed="0.05" time_allowance="10"/>
+          <Wait wait_duration="3"/>
         </RoundRobin>
       </ReactiveFallback>
     </RecoveryNode>

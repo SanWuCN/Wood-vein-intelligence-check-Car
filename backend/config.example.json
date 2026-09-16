@@ -41,5 +41,8 @@
     "max_jump_m": 0.8,
     "confirm_frames": 3,
     "marker_pose": null
-  }
+  },
+  "cruise_clearance": 0.22,
+  "cruise_skip_near_m": 0.25,
+  "cruise_skip_stall_s": 5.0
 }

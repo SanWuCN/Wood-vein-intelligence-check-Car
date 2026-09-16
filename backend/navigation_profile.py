@@ -30,16 +30,17 @@ def available_mppi_critics():
 _MPPI_CRITICS = None
 
 
-def apply_forward_profile(cfg,root,arrival_radius=.20,clearance=.30,min_turn_radius=.30):
+def apply_forward_profile(cfg,root,arrival_radius=.20,clearance=.22,min_turn_radius=.30):
     """前向导航配置 + 连续巡航行为树。
 
     arrival_radius 是“算作到达航点”的半径（行为树的经过半径用它；终点停靠容差另取，见下），
     规划器容差取它的 2/3（且不超过 0.25），否则规划出的路径可能停在航点 0.25 m 外，
     反而永远满足不了经过判定，小车就会绕回去。
 
-    clearance 是障碍物周边的禁区半径：把有效足迹换成半径 clearance 的圆（内切半径=禁区半径），
-    代价地图会把该范围内的栅格标成内切/致命，规划器无法进入；膨胀半径取其 1.5 倍，
-    让 30–45 cm 之间“很贵但可通行”，从而优先选择更宽松的通道。"""
+    clearance 是障碍物周边的**硬禁区**半径：把有效足迹换成半径 clearance 的圆，
+    代价地图把该范围内的栅格标成内切/致命，规划器无法进入。它必须小于真实可通行余量，
+    否则车（或其估计位置）一旦靠近墙，规划器就会报 "Starting point in lethal space" 直接失败。
+    软避让交给膨胀半径（≥0.45 m），让规划器在“很贵但可通行”的代价下优先挑宽敞通道。"""
     planner=cfg['planner_server']['ros__parameters']['GridBased']
     controller=cfg['controller_server']['ros__parameters']['FollowPath']
     arrival_radius=max(.05,min(float(arrival_radius),1.))
@@ -77,7 +78,9 @@ def apply_forward_profile(cfg,root,arrival_radius=.20,clearance=.30,min_turn_rad
         params['footprint']=footprint_text(circle_footprint(clearance,center))
         layer=params.setdefault('inflation_layer',{})
         layer['enabled']=True
-        layer['inflation_radius']=round(clearance*1.5,2)
+        # 硬禁区（内切半径=足迹半径）要小，否则车稍微靠近墙就“起点在致命区”导致规划失败；
+        # 软避让（膨胀）留大，规划器仍会主动挑 ≥45 cm 的通道。
+        layer['inflation_radius']=round(max(clearance*1.5,.45),2)
         layer.setdefault('cost_scaling_factor',3.0)
     # AMCL：默认参数在这个场地上偏保守——走 25 cm 才更新一次、自恢复被关死（收敛到错位置就回不来）
     amcl=cfg.setdefault('amcl',{}).setdefault('ros__parameters',{})

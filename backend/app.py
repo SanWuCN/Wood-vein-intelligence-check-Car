@@ -281,12 +281,13 @@ class Console:
             return {'ok':True,'state':'localizing','pose':p,'snap':snap}
         if key==('navigation','preview'):
             result=await self.bridge.preview(body.get('points'),body.get('mode','multi'))
-            return {'ok':True,**result,'min_radius':path_min_radius(body.get('points') or []),
+            return {'ok':True,**result,'nudged_cm':getattr(self.bridge,'nudged_cm',0),
+                    'min_radius':path_min_radius(body.get('points') or []),
                     'tight_turn_ratio':round(infeasible_turn_ratio(body.get('points') or []),3)}
         if key==('navigation','start'):
             if body.get('map_id')!=self.active_map_id or not self.active_map_id:raise ConsoleError('MAP_MISMATCH','任务地图与已加载地图不一致')
             speed=finite(body.get('speed_mps'), 'speed_mps',.05,self.config['max_speed_mps']);self.bridge.speed=speed
-            result=self.bridge.start_mission(body.get('points'),body.get('mode','multi'))
+            result=await self.bridge.start_mission(body.get('points'),body.get('mode','multi'))
             return {'ok':True,'mission':result,'min_radius':path_min_radius(body.get('points') or []),
                     'tight_turn_ratio':round(infeasible_turn_ratio(body.get('points') or []),3)}
         if key==('navigation','pause'):
