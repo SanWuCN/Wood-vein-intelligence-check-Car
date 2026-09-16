@@ -18,7 +18,23 @@ class Media:
         w,h=self.config['rviz_size'];chrome=self.config.get('rviz_chrome') or {}
         return w,h,int(chrome.get('left',25)),int(chrome.get('top',71)),int(chrome.get('right',25)),int(chrome.get('bottom',39))
 
+    def rviz_active(self):
+        return bool(self.processes.jobs.get('rviz')) and self.processes.jobs['rviz'].poll() is None
+
+    async def set_rviz(self,active):
+        """RViz 常驻会吃掉整整一个核（Jetson 上 load 已接近 8/8），改成按需启停：
+        界面切到 RViz 页才启动，切回地图页就关掉。"""
+        if active:
+            if not self.rviz_active():
+                await self.start_rviz()
+            return {'active':True}
+        await self.processes.stop('rviz')
+        await self.processes.stop('rviz-layout')
+        self.rviz_jpeg=None;self.rviz_at=0
+        return {'active':False}
+
     async def initialize(self):
+        """只准备虚拟显示与配置；RViz 本身按需启动（它常驻要吃掉一个核）。"""
         display=self.config['rviz_display'];w,h,cl,ct,cr,cb=self.geometry()
         self.processes.spawn('xvfb',['Xvfb',display,'-screen','0',f'{w}x{h}x24','-nolisten','tcp','-ac','-nocursor'])
         await asyncio.sleep(1)
@@ -26,6 +42,13 @@ class Media:
         config_path=self.root/'runtime'/'rviz'/'console.rviz'
         config_path.parent.mkdir(parents=True,exist_ok=True)
         shutil.copyfile(self.root/'deploy'/'console.rviz',config_path)
+
+    async def start_rviz(self):
+        """启动 RViz 与布局脚本（幂等）。"""
+        await self.initialize()
+        if self.rviz_active():return
+        display=self.config['rviz_display'];w,h,cl,ct,cr,cb=self.geometry()
+        config_path=self.root/'runtime'/'rviz'/'console.rviz'
         self.processes.spawn('rviz',['rviz2','-d',str(config_path)],{'DISPLAY':display,'QT_X11_NO_MITSHM':'1','LIBGL_ALWAYS_SOFTWARE':'1'})
         # RViz occupies a dedicated virtual display; kiosk capture can never recurse.
         await asyncio.sleep(2)

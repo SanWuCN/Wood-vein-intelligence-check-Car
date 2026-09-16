@@ -133,7 +133,7 @@ class Console:
         state=self.bridge.snapshot()
         state.update({'schema_version':'1.0','device_id':self.config['device_id'],'sampled_at':time.time(),'simulated':self.simulate,'metrics':dict(self.metrics),'active_map_id':self.active_map_id,'transition':self.transition,'max_speed_mps':self.config['max_speed_mps'],
                       'platform':{'state':self.uplink.state,'last_success':self.uplink.last_success,'error':self.uplink.error},
-                      'avoidance':getattr(self.bridge,'avoidance_state',{'enabled':True}),'mapping':self.mapping_status(),'streams':{'rviz':'/api/streams/rviz.mjpeg','camera':'/api/streams/camera.mjpeg','rviz_state':('online' if self.media and time.time()-self.media.rviz_at<3 else 'offline'),'rtmp':self.media.rtmp if self.media else {}},'last_error':self.last_error})
+                      'avoidance':getattr(self.bridge,'avoidance_state',{'enabled':True}),'mapping':self.mapping_status(),'rviz_active':bool(self.media and self.media.rviz_active()),'streams':{'rviz':'/api/streams/rviz.mjpeg','camera':'/api/streams/camera.mjpeg','rviz_state':('online' if self.media and time.time()-self.media.rviz_at<3 else 'offline'),'rtmp':self.media.rtmp if self.media else {}},'last_error':self.last_error})
         return state
 
     async def websocket(self,req):
@@ -236,6 +236,11 @@ class Console:
             if self.bridge.mode!='navigation':raise ConsoleError('NOT_NAVIGATING','请先加载巡航地图')
             if self.bridge.mission['state'] in ('running','accepting','paused','pausing','stopping'):raise ConsoleError('MISSION_ACTIVE','请先停止巡航')
             self.start_auto_localize();return {'ok':True,'state':'localizing'}
+        if key==('media','rviz'):
+            active=body.get('active')
+            if not isinstance(active,bool):raise ConsoleError('INVALID_ARGUMENT','active 需要 true/false',422)
+            if not self.media:raise ConsoleError('NO_MEDIA','媒体模块未就绪',503)
+            return {'ok':True,'rviz':await self.media.set_rviz(active)}
         if key==('navigation','avoidance'):
             enabled=body.get('enabled')
             if not isinstance(enabled,bool):raise ConsoleError('INVALID_ARGUMENT','enabled 需要 true/false',422)

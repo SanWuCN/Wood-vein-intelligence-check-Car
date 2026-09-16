@@ -77,6 +77,10 @@ class RosBridge(Node):
         self.skip_stall=float(config.get('cruise_skip_stall_s',5.))
         self.skip_detour=float(config.get('cruise_skip_detour_deg',120.))
         self._stall_ref=None;self._stall_since=None
+        # 任务运行中的“车没动”监控：既用于前端提示，也用于卡住时自动跳点
+        self.stuck_s=0.;self._move_ref=None;self._move_at=None;self.stuck_skips=0
+        self.stuck_after=float(config.get('cruise_stuck_s',8.))
+        self.stuck_max=int(config.get('cruise_stuck_max',6))
         # 相机（ArUco 标签）绝对定位校正：看到已知位置的标签就把车拽回绝对位姿
         aruco=dict(config.get('aruco') or {})
         self.aruco={'enabled':bool(aruco.get('enabled',True)),'marker_id':aruco.get('marker_id',582),
@@ -155,6 +159,7 @@ class RosBridge(Node):
         self.refine_timer=self.create_timer(1.,self.idle_refine_tick)
         self.record_timer=self.create_timer(.2,self.record_tick)
         self.skip_timer=self.create_timer(.5,self.mission_skip_tick)
+        self.stuck_timer=self.create_timer(.5,self.stuck_tick)
         self.relocalize_timer=self.create_timer(.5,self.mission_relocalize_tick)
         self.aruco_timer=self.create_timer(.5,self.aruco_tick)
         self.speed_timer=self.create_timer(1.,self.publish_speed)
@@ -663,6 +668,42 @@ class RosBridge(Node):
                 self.goal_handle=handle;self.mission['state']='running'
             handle.get_result_async().add_done_callback(lambda f:self._finished(f,ticket))
         f.add_done_callback(accepted)
+
+    def stuck_tick(self):
+        """车是不是停在原地不动（任务运行中）：供前端显示原因，并在超过阈值时自动跳点。"""
+        now=time.time()
+        with self.lock:
+            if self.mission['state'] not in ('running','accepting'):
+                self.stuck_s=0.;self._move_ref=None;self._move_at=None;return
+            pose=self.pose if time.time()-self.pose_at<2 else None
+        if not pose:
+            self.stuck_s=0.;return
+        if self._move_ref is None or math.hypot(pose['x']-self._move_ref[0],pose['y']-self._move_ref[1])>.03:
+            self._move_ref=(pose['x'],pose['y']);self._move_at=now;self.stuck_s=0.;return
+        self.stuck_s=now-(self._move_at or now)
+        if self.stuck_s<self.stuck_after or self._skipping:return
+        if self.stuck_skips>=self.stuck_max:
+            with self.lock:
+                self.mission['state']='failed'
+                self.mission['abort_reason']='stuck'
+                self.mission['stop_reason']=(f'车连续 {int(self.stuck_s)} s 没有前进（已尝试跳过 {self.stuck_skips} 个航点仍不行）：'
+                                             '多为前方被挡、路径不可行或控制器算不过来（可关避障或降低巡航速度）')
+                self.error='已停车：'+self.mission['stop_reason']
+                handle=self.goal_handle;self.goal_handle=None
+            try:
+                if handle:handle.cancel_goal_async()
+                for _ in range(5):self.stop_pub.publish(Twist())
+            except Exception:pass
+            return
+        # 卡住 → 跳过当前航点继续（比原地等恢复动作快得多）
+        with self.lock:
+            self._skipping=True;self._last_skip_at=now;self.stuck_skips+=1
+            self.mission['skip_reason']='卡住不动，已跳过'
+            self._move_ref=None;self._move_at=now;self.stuck_s=0.
+            handle=self.goal_handle
+        try:handle.cancel_goal_async()
+        except Exception:
+            with self.lock:self._skipping=False
 
     def mission_skip_tick(self):
         """当前航点要不要跳过（用户要求：兜圈子就直接去下一个点）。

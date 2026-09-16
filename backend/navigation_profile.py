@@ -110,6 +110,16 @@ def apply_forward_profile(cfg,root,arrival_radius=.20,clearance=.22,min_turn_rad
     goal_checker=cfg['controller_server']['ros__parameters'].setdefault('goal_checker',{})
     goal_checker.update({'xy_goal_tolerance':stop_radius,'yaw_goal_tolerance':3.141592653589793,'stateful':True})
     controller.setdefault('GoalAngleCritic',{})['enabled']=False
+    # MPPI 计算量：Jetson 上 20Hz × 56 步 × 2000 采样跑不动，日志刷
+    # "Control loop missed its desired rate of 20.0000Hz"，表现是车走不动/一直在微调。
+    # 0.1 m/s 的巡航不需要 20 Hz，也不需要在 2.8 s 外做预测。
+    cs=cfg['controller_server']['ros__parameters']
+    cs['controller_frequency']=10.0
+    controller['time_steps']=26
+    controller['model_dt']=0.1
+    controller['batch_size']=1000
+    controller['visualize']=False
+    controller['publish_optimal_trajectory']=False
     # MPPI 加速度死区：抑制“一点点前进 + 左右修方向”的持续微调。
     # 只有当前构建确实提供该 critic 时才加——加不存在的插件会让控制器 configure 直接 FATAL，
     # 进而 lifecycle_manager 中止整个 Nav2 bringup（预览直接超时）。
