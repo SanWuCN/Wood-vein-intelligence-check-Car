@@ -48,11 +48,30 @@ class ForwardProfileTests(unittest.TestCase):
   p=cfg['local_costmap']['local_costmap']['ros__parameters']
   xs=[q[0] for q in footprint_points(p['footprint'])]
   self.assertAlmostEqual((max(xs)-min(xs))/2,.5,places=3)
+ def test_dense_route_keeps_small_passed_radius_but_stops_comfortably(self):
+  root=Path(__file__).resolve().parents[1]
+  cfg={'planner_server':{'ros__parameters':{'GridBased':{}}},'controller_server':{'ros__parameters':{'FollowPath':{'critics':['GoalCritic','PathFollowCritic']}}},'bt_navigator':{'ros__parameters':{}}}
+  apply_forward_profile(cfg,root,.08)
+  # 经过半径保持 8 cm（密集航点才分得开），停靠容差放宽到 20 cm（不在点旁磨轮子）
+  self.assertEqual(cfg['controller_server']['ros__parameters']['goal_checker']['xy_goal_tolerance'],.20)
+  bt=ET.parse(root/'runtime/behavior_trees/continuous_navigation.xml').getroot()
+  self.assertEqual(bt.find('.//RemovePassedGoals').get('radius'),'0.08')
+ def test_velocity_deadband_critic_is_added(self):
+  root=Path(__file__).resolve().parents[1]
+  cfg={'planner_server':{'ros__parameters':{'GridBased':{}}},'controller_server':{'ros__parameters':{'FollowPath':{'critics':['GoalCritic','PathFollowCritic']}}},'bt_navigator':{'ros__parameters':{}}}
+  apply_forward_profile(cfg,root,.08)
+  follow=cfg['controller_server']['ros__parameters']['FollowPath']
+  self.assertIn('VelocityDeadbandCritic',follow['critics'])
+  self.assertTrue(follow['VelocityDeadbandCritic']['enabled'])
+  self.assertEqual(follow['VelocityDeadbandCritic']['deadband_velocity'][0],.05)
+  apply_forward_profile(cfg,root,.08)                      # 幂等：重复调用不重复插入
+  self.assertEqual(follow['critics'].count('VelocityDeadbandCritic'),1)
  def test_arrival_radius_is_configurable(self):
   root=Path(__file__).resolve().parents[1]
   cfg={'planner_server':{'ros__parameters':{'GridBased':{}}},'controller_server':{'ros__parameters':{'FollowPath':{}}},'bt_navigator':{'ros__parameters':{}}}
   apply_forward_profile(cfg,root,.35)
-  self.assertEqual(cfg['controller_server']['ros__parameters']['goal_checker']['xy_goal_tolerance'],.35)
+  # 停靠容差有 25 cm 上限（到点判定仍按传入值）
+  self.assertEqual(cfg['controller_server']['ros__parameters']['goal_checker']['xy_goal_tolerance'],.25)
   self.assertEqual(cfg['planner_server']['ros__parameters']['GridBased']['tolerance'],.233)
   import xml.etree.ElementTree as ET
   bt=ET.parse(cfg['bt_navigator']['ros__parameters']['default_nav_through_poses_bt_xml'])

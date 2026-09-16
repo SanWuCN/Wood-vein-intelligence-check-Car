@@ -302,8 +302,12 @@ class RosBridge(Node):
                         and max(self.amcl['covariance'][0],self.amcl['covariance'][7])<.5
                         and self.amcl['covariance'][35]<.5)
 
-    def pose_msg(self,p):
-        msg=PoseStamped();msg.header.frame_id='map';msg.header.stamp=self.get_clock().now().to_msg()
+    def pose_msg(self,p,age=0.):
+        # 时间戳回拨一点：AMCL 会把 /initialpose 通过 TF 变换到 odom 帧，
+        # 用“当前时刻”时常因 TF 还没到而报 "extrapolation into the future" 并丢弃该位姿。
+        msg=PoseStamped();msg.header.frame_id='map'
+        stamp=self.get_clock().now()-Duration(seconds=max(0.,age))
+        msg.header.stamp=stamp.to_msg()
         msg.pose.position.x=p['x'];msg.pose.position.y=p['y'];msg.pose.orientation.z=math.sin(p['yaw']/2);msg.pose.orientation.w=math.cos(p['yaw']/2)
         return msg
 
@@ -349,7 +353,7 @@ class RosBridge(Node):
         if self.mode!='navigation':raise ConsoleError('NOT_NAVIGATING','请先加载巡航地图')
         if self.mission['state'] in ('running','accepting','pausing','paused','stopping'):raise ConsoleError('MISSION_ACTIVE','请先停止巡航')
         self.localization_epoch+=1
-        msg=PoseWithCovarianceStamped();pose=self.pose_msg(p);msg.header=pose.header;msg.pose.pose=pose.pose
+        msg=PoseWithCovarianceStamped();pose=self.pose_msg(p,age=.05);msg.header=pose.header;msg.pose.pose=pose.pose
         var_xy,var_yaw=covariance or (.25,.0685)
         msg.pose.covariance[0]=var_xy;msg.pose.covariance[7]=var_xy;msg.pose.covariance[35]=var_yaw
         self.amcl=None;self.error=None

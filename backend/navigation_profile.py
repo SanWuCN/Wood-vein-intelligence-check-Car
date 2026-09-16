@@ -8,7 +8,7 @@ from core import circle_footprint, footprint_center, footprint_text
 def apply_forward_profile(cfg,root,arrival_radius=.25,clearance=.30):
     """前向导航配置 + 连续巡航行为树。
 
-    arrival_radius 是“算作到达航点”的半径：行为树的经过半径与终点 goal_checker 都用它，
+    arrival_radius 是“算作到达航点”的半径（行为树的经过半径用它；终点停靠容差另取，见下），
     规划器容差取它的 2/3（且不超过 0.25），否则规划出的路径可能停在航点 0.25 m 外，
     反而永远满足不了经过判定，小车就会绕回去。
 
@@ -57,9 +57,22 @@ def apply_forward_profile(cfg,root,arrival_radius=.25,clearance=.30):
     amcl['laser_max_range']=11.5     # 比雷达量程略小，超过的读数按无效丢弃（默认 100 会把"无回波"当有效）
     amcl['laser_model_type']='likelihood_field'
     amcl['laser_likelihood_max_dist']=2.0
+    # 两件事必须分开：
+    #  - 行为树“经过半径”要小（密集航点才分得开，默认 8 cm）
+    #  - 终点“停靠容差”要留余量，否则车到不了那么准，就会在点旁一直磨轮子
+    passed_radius=arrival_radius
+    stop_radius=round(min(.25,max(passed_radius,.20)),3)
     goal_checker=cfg['controller_server']['ros__parameters'].setdefault('goal_checker',{})
-    goal_checker.update({'xy_goal_tolerance':arrival_radius,'yaw_goal_tolerance':3.141592653589793,'stateful':True})
+    goal_checker.update({'xy_goal_tolerance':stop_radius,'yaw_goal_tolerance':3.141592653589793,'stateful':True})
     controller.setdefault('GoalAngleCritic',{})['enabled']=False
+    # MPPI 加速度死区：抑制“一点点前进 + 左右修方向”的持续微调（轮子一直在响）
+    follow=cfg['controller_server']['ros__parameters'].setdefault('FollowPath',{})
+    critics=list(follow.get('critics') or [])
+    if critics and 'VelocityDeadbandCritic' not in critics:
+        critics.insert(critics.index('GoalCritic') if 'GoalCritic' in critics else len(critics),'VelocityDeadbandCritic')
+        follow['critics']=critics
+    follow.setdefault('VelocityDeadbandCritic',{}).update({'enabled':True,'cost_power':1,'cost_weight':1.0,
+                                                           'deadband_velocity':[.05,0.,.2]})
     return cfg
 
 
