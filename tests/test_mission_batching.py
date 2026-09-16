@@ -7,7 +7,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'backend'))
 from core import (MAP_SAVE_TOLERANCE, ConsoleError, circle_footprint, footprint_center, footprint_points, footprint_text,
                   grid_diff_ratio, infeasible_turn_ratio, lap_number, missed_waypoint, path_min_radius, plan_batch,
-                  points_within, should_backup_map, simplify_path,
+                  points_within, relocalize_decision, should_backup_map, simplify_path,
                   prune_reached_goals, record_step, remaining_route_distance, start_conflict,
                   validate_waypoints, waypoint_index)
 
@@ -249,3 +249,32 @@ class SimplifyPathTests(unittest.TestCase):
         sharp = [{'x': 0., 'y': 0.}, {'x': .3, 'y': 0.}, {'x': .3, 'y': .3}]   # 90° 直角
         self.assertLess(path_min_radius(sharp), .35)
         self.assertGreater(infeasible_turn_ratio(sharp), .9)
+
+
+class RelocalizeDecisionTests(unittest.TestCase):
+    """航行中定位守护：吻合度持续偏低先重锚，多次无效就安全停车。"""
+
+    def base(self, **over):
+        s = dict(enabled=True, mission='running', match=.5, low_since=100., last_at=0.,
+                 after_s=2., interval_s=5., count=0, max_count=4, threshold=.55)
+        s.update(over)
+        return s
+
+    def test_anchors_after_low_match_persists(self):
+        self.assertEqual(relocalize_decision(self.base(), 120.), ('anchor', 'low'))
+
+    def test_waits_when_match_is_fine(self):
+        self.assertEqual(relocalize_decision(self.base(match=.9), 120.), ('wait', 'ok'))
+
+    def test_waits_before_confirmed_or_rate_limited(self):
+        self.assertEqual(relocalize_decision(self.base(low_since=119.), 120.)[1], 'low')
+        self.assertEqual(relocalize_decision(self.base(last_at=118.), 120.)[1], 'wait')
+
+    def test_stops_after_max_attempts(self):
+        self.assertEqual(relocalize_decision(self.base(count=4), 120.), ('stop', 'exhausted'))
+
+    def test_ignores_idle_and_disabled(self):
+        for mission in ('idle', 'stopped', 'completed', 'failed'):
+            self.assertEqual(relocalize_decision(self.base(mission=mission), 120.), ('wait', 'mission'))
+        self.assertEqual(relocalize_decision(self.base(enabled=False), 120.), ('wait', 'disabled'))
+        self.assertEqual(relocalize_decision(self.base(match=None), 120.), ('wait', 'no_match'))

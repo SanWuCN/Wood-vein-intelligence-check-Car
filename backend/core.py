@@ -552,3 +552,25 @@ def _rdp(points, epsilon):
         if dist > worst: worst, index = dist, i
     if worst <= epsilon: return [start, end]
     return _rdp(points[:index + 1], epsilon)[:-1] + _rdp(points[index:], epsilon)
+
+
+RELOCALIZE_MISSION_STATES = ('running', 'accepting', 'paused')
+
+
+def relocalize_decision(state, now):
+    """航行中定位守护的判定，返回 ('wait'|'anchor'|'stop', 原因)。
+
+    吻合度持续偏低说明 AMCL 的位姿与地图对不上：先围绕当前位姿做小窗口吸附重锚；
+    连续多次仍不达标就安全停车，避免车在错误位姿下继续走。
+    state: enabled / mission / match / low_since / last_at / after_s / interval_s / count / max_count。"""
+    if not state.get('enabled'): return 'wait', 'disabled'
+    if state.get('mission') not in RELOCALIZE_MISSION_STATES: return 'wait', 'mission'
+    match = state.get('match')
+    if match is None: return 'wait', 'no_match'
+    if match >= state.get('threshold', .55): return 'wait', 'ok'
+    low_since = state.get('low_since')
+    if low_since is None: return 'wait', 'low'
+    if now - low_since < state.get('after_s', 2.): return 'wait', 'low'
+    if now - (state.get('last_at') or 0.) < state.get('interval_s', 5.): return 'wait', 'wait'
+    if state.get('count', 0) >= state.get('max_count', 4): return 'stop', 'exhausted'
+    return 'anchor', 'low'

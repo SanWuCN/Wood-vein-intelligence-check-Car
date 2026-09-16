@@ -26,6 +26,7 @@ from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 from cv_bridge import CvBridge
 import cv2
 from core import (ConsoleError, automatic_goals, bounds, grid_likelihood, idle_refine_decision, lap_number, missed_waypoint,
+                  relocalize_decision,
                     map_image, plan_batch, points_within, prune_reached_goals, record_step, remaining_route_distance, start_conflict,
                     validate_waypoints, waypoint_index,
                     world_to_cell, snap_pose as core_snap_pose)
@@ -68,6 +69,15 @@ class RosBridge(Node):
         self.lookahead_max=int(config.get('cruise_lookahead_max_points',40) or 0)
         self.skip_missed=bool(config.get('skip_missed_points',True))
         self._skipping=False;self._last_skip_at=0.
+        # 航行中定位守护：吻合度持续偏低时小窗口吸附重锚，连续失败则安全停车
+        self.relocalize_enabled=bool(config.get('cruise_relocalize',True))
+        self.relocalize_match=float(config.get('cruise_relocalize_match',.55))
+        self.relocalize_after=float(config.get('cruise_relocalize_after_s',2.))
+        self.relocalize_interval=float(config.get('cruise_relocalize_interval_s',5.))
+        self.relocalize_max=int(config.get('cruise_relocalize_max',4))
+        self.relocalize_state={'enabled':self.relocalize_enabled,'count':0,'reason':'disabled','match':None,
+                               'shift_m':None,'shift_deg':None,'at':None}
+        self._match_low_since=None;self._last_relocalize_at=0.
         self.clearance=float(config.get('cruise_clearance',.30))
         self._like=None;self._like_rev=None
         # 航迹记录（遥控教学）：每 record_step_m 米记一个点，直接可存成路线
@@ -119,6 +129,7 @@ class RosBridge(Node):
         self.refine_timer=self.create_timer(1.,self.idle_refine_tick)
         self.record_timer=self.create_timer(.2,self.record_tick)
         self.skip_timer=self.create_timer(.5,self.mission_skip_tick)
+        self.relocalize_timer=self.create_timer(.5,self.mission_relocalize_tick)
         self.speed_timer=self.create_timer(1.,self.publish_speed)
         self.spin_executor=MultiThreadedExecutor(num_threads=3);self.spin_executor.add_node(self)
         self.thread=threading.Thread(target=self.spin_executor.spin,daemon=True);self.thread.start()
@@ -481,7 +492,7 @@ class RosBridge(Node):
             self.navigation_goals=automatic_goals(points,self.pose,mode)
             self.route_cursor=0
             self.epoch+=1
-            self.mission={'state':'accepting','index':0,'cycle':0,'points':points,'mode':mode,'distance_remaining':None,'skipped':0}
+            self.mission={'state':'accepting','index':0,'cycle':0,'points':points,'mode':mode,'distance_remaining':None,'skipped':0,'abort_reason':None}
             self.error=None;self.publish_speed();self._send_nav(self.epoch)
             return dict(self.mission)
 
@@ -549,6 +560,47 @@ class RosBridge(Node):
         except Exception:
             with self.lock:self._skipping=False
 
+    def mission_relocalize_tick(self):
+        """航行中定位守护：吻合度持续偏低 → 小窗口吸附并重锚；多次无效 → 安全停车。"""
+        now=time.time()
+        with self.lock:
+            match=self.match if now-self.match_at<2 else None
+            pose=self.pose if now-self.pose_at<2 else None
+            low=match is not None and match<self.relocalize_match and self.mission['state'] in ('running','accepting','paused')
+            if not low:self._match_low_since=None
+            elif self._match_low_since is None:self._match_low_since=now
+            action,reason=relocalize_decision({'enabled':self.relocalize_enabled,'mission':self.mission['state'],'match':match,
+                'low_since':self._match_low_since,'last_at':self._last_relocalize_at,'after_s':self.relocalize_after,
+                'interval_s':self.relocalize_interval,'count':self.relocalize_state['count'],'max_count':self.relocalize_max,
+                'threshold':self.relocalize_match},now)
+            self.relocalize_state.update({'reason':reason,'match':round(match,3) if match is not None else None})
+        if action=='wait' or not pose:return
+        if action=='stop':
+            with self.lock:
+                self.mission['state']='failed'
+                self.mission['abort_reason']='localization'
+                self.error=f'定位持续失准（吻合度 {int((match or 0)*100)}%），已安全停车，请重新定位后再巡航'
+                handle=self.goal_handle;self.goal_handle=None;self.pending_goal=None
+            try:
+                if handle:handle.cancel_goal_async()
+                for _ in range(5):self.stop_pub.publish(Twist())
+            except Exception:pass
+            self.relocalize_state.update({'reason':'stopped','at':now})
+            return
+        # action == 'anchor'：围绕当前位姿做一次小窗口吸附，采纳后重锚 AMCL
+        self._last_relocalize_at=now
+        try:result=self.snap_pose({'x':pose['x'],'y':pose['y'],'yaw':pose['yaw']},max_shift=.25,max_yaw_deg=8.)
+        except Exception as e:
+            self.get_logger().warning(f'relocalize: {e}');return
+        if not result.get('applied') or (abs(result.get('shift_m') or 0)<.01 and abs(result.get('shift_deg') or 0)<.3):
+            self.relocalize_state.update({'reason':'no_gain','at':now});return
+        try:self.localize(result['pose'],covariance=(.10,.03))
+        except Exception as e:
+            self.get_logger().warning(f'relocalize publish: {e}');return
+        self.relocalize_state.update({'count':self.relocalize_state['count']+1,'reason':'applied','at':now,
+                                      'shift_m':result.get('shift_m'),'shift_deg':result.get('shift_deg'),
+                                      'match':round(match,3) if match is not None else None,'score':result.get('score')})
+
     def _finished(self,f,ticket):
         with self.lock:
             if ticket!=self.epoch:return
@@ -564,7 +616,12 @@ class RosBridge(Node):
                     self.mission['index']=self._waypoint_index();self.mission['state']='accepting'
                     self._send_nav(self.epoch)
                     return
-                self.mission['state']='failed';self.error='导航未完成';return
+                self.mission['state']='failed'
+                # 控制器报“无法前进”时吻合度往往偏低，据此把原因说清楚
+                self.mission['abort_reason']='progress' if (self.match or 1.)<self.relocalize_match else 'unknown'
+                self.error=('导航被中止：车没能继续前进（多为前方被挡住，或定位偏差导致路径不可行），已停车'
+                            if self.mission['abort_reason']=='progress' else '导航未完成，已停车')
+                return
             self.pending_goal=None
             # 一批可能覆盖多个航点：整批走完才推进游标
             start=self.route_cursor
@@ -618,7 +675,7 @@ class RosBridge(Node):
             return {'mode':self.mode,'uptime_s':int(now-self.started_at),'map':self.map_meta,
                     'pose':self.pose if now-self.pose_at<2 else None,'scan_points':self.scan_points,'path':self.plan,
                     'navigation':{'ready':self.nav.server_is_ready(),'planner_ready':self.planner.server_is_ready()},
-                    'localization':{'ready':self.localized(),'match':self.match,'refine':dict(self.refine_state),'amcl_received':self.amcl is not None,'match_age_s':age(self.match_at),'covariance':{'x_m2':self.amcl['covariance'][0],'y_m2':self.amcl['covariance'][7],'yaw_rad2':self.amcl['covariance'][35]} if self.amcl else None},
+                    'localization':{'ready':self.localized(),'match':self.match,'refine':dict(self.refine_state),'relocalize':dict(self.relocalize_state),'amcl_received':self.amcl is not None,'match_age_s':age(self.match_at),'covariance':{'x_m2':self.amcl['covariance'][0],'y_m2':self.amcl['covariance'][7],'yaw_rad2':self.amcl['covariance'][35]} if self.amcl else None},
                     'velocity':self.odom if now-self.odom_at<2 else None,
                     'imu':self.imu if now-self.imu_at<2 else None,'imu_history':list(self.imu_history),
                     'lidar':{'state':'online' if now-self.scan_at<2 else 'offline','hz':hz(self.scan_times) if now-self.scan_at<2 else None,'age_s':age(self.scan_at)},

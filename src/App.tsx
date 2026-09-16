@@ -103,6 +103,7 @@ export function App(){
  const refine=s?.localization?.refine;
  const toggleRefine=()=>run('refine',()=>request('/navigation/refine',{enabled:!refine?.enabled}),refine?.enabled?'已关闭静止校准':'已开启静止校准');
  /* 静止校准状态提示：开启时持续显示，刚校正过或有关键提示时也显示 */
+ const relocalize=s?.localization?.relocalize;
  const refineHint=refine&&(refine.enabled||refine.applied)?refineText(refine):'';
  const pointsSig=JSON.stringify(points);
  useEffect(()=>{setPathStale(true)},[pointsSig]);   // 航点一改，旧路径就不再对应当前路线
@@ -127,6 +128,7 @@ export function App(){
  <div className="map-view">
  {mapView==='map'?<><MapCanvas meta={s?.map||null} pose={s?.pose||null} scan={s?.scan_points||[]} path={pathStale?[]:(s?.path||[])} points={tab==='cruise'?points:[]} record={tab==='cruise'?recordedPoints:[]} tool={tool} onPlace={place} enabled={actionAllowed&&mapLoaded&&!locked}/>{tab==='cruise'&&mapLoaded&&!locked&&<div className="map-nudge" role="group" aria-label="定位微调">{[[<RotateCcw size={13}/>,'逆时针 1.5°',0,0,-1,'逆时针微调'],[<ArrowUp size={13}/>,'向上 2 cm',0,1,0,'向上微调'],[<RotateCw size={13}/>,'顺时针 1.5°',0,0,1,'顺时针微调'],[<ArrowLeft size={13}/>,'向左 2 cm',-1,0,0,'向左微调'],[<ArrowDown size={13}/>,'向下 2 cm',0,-1,0,'向下微调'],[<ArrowRight size={13}/>,'向右 2 cm',1,0,0,'向右微调']].map(([icon,title,r,u,turn,label],i)=><button key={i} title={title as string} aria-label={label as string} disabled={!actionAllowed||busy==='nudge'} onClick={()=>nudge(r as number,u as number,turn as number)}>{icon}</button>)}</div>}</>:<><div className="rviz-view"><Video src="/api/streams/rviz.mjpeg" online={connected&&s?.streams.rviz_state==='online'} title="RViz 实时画面"/></div><span className="map-hint"><Radio size={12}/>{rvizHint}</span></>}
  {tab==='cruise'&&mapView==='map'&&refineHint&&<span className="map-hint refine-hint"><Magnet size={12}/>{refineHint}</span>}
+ {tab==='cruise'&&mapView==='map'&&!!relocalize?.count&&(relocalize.count>0)&&<span className={'map-hint '+(relocalize.reason==='stopped'?'stale-hint':'refine-hint')} style={{right:8,top:38}}><Crosshair size={12}/>航行中自动校准 {relocalize.count} 次{relocalize.shift_m!=null?`（最近 ${relocalize.shift_m.toFixed(2)} m / ${(relocalize.shift_deg??0).toFixed(1)}°）`:''}{relocalize.reason==='stopped'?' · 已安全停车':''}</span>}
  {tab==='cruise'&&mapView==='map'&&record?.active&&<span className="map-hint record-hint"><CircleDot size={12}/>记录中 {record.count} 点 / {(record.distance_m||0).toFixed(1)} m</span>}
  {tab==='cruise'&&mapView==='map'&&!record?.active&&pathStale&&points.length>0&&(s?.path?.length||0)>0&&<span className="map-hint stale-hint">航点已改动，路径未更新，请重新“预览”</span>}
  {s?.transition&&<div className="map-loading"><LoaderCircle className="spin" size={22}/><span>{s.transition==='reset'?'正在重置环境':s.transition==='mapping'?'正在启动建图':'正在加载地图'}</span></div>}
