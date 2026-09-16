@@ -146,6 +146,7 @@ class RosBridge(Node):
                                         ('/global_costmap/global_costmap/set_parameters','/local_costmap/local_costmap/set_parameters')]
         except Exception:
             self.costmap_param_clients=[]
+        self.serial_state={}
         self.avoidance=bool(config.get('cruise_avoidance',True))
         self.avoidance_state={'enabled':self.avoidance}
         self.speed_pub=self.create_publisher(SpeedLimit,'/speed_limit',QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
@@ -395,6 +396,37 @@ class RosBridge(Node):
                 self.stop_pub.publish(twist);await asyncio.sleep(.1)
             self.stop_pub.publish(Twist());await asyncio.sleep(.4)
         return max_bursts
+
+    async def _publish_stop(self,count=3,gap=.06):
+        """发几条零速让底盘停车：条数少、间隔均匀，避免瞬时突发压垮下位机串口。"""
+        for i in range(max(1,count)):
+            self.stop_pub.publish(Twist())
+            if i+1<max(1,count):await asyncio.sleep(gap)
+
+    def serial_snapshot(self):
+        """抓一份"谁在占用底盘串口"的现场，用于定位串口掉线。
+
+        底盘串口是 /dev/wheeltec_controller（ttyACM0，IMU 也从这条走），
+        车上另有 ip_serial_sender.service（把 IP 从串口发出）等会开串口的程序，
+        一旦有第二个进程打开同一串口，驱动就会抛
+        SerialException: device reports readiness to read but returned no data。
+        """
+        import subprocess
+        def run(cmd):
+            try:
+                r=subprocess.run(cmd,shell=True,capture_output=True,text=True,timeout=6)
+                return (r.stdout or '')+(r.stderr or '')
+            except Exception as e:return f'<{e}>'
+        info={
+            'device':run('ls -l /dev/wheeltec_controller /dev/ttyACM* 2>&1 | head -8'),
+            'holders':run('fuser -v /dev/wheeltec_controller /dev/ttyACM0 2>&1 | head -20'),
+            'open_fds':run("for p in /proc/[0-9]*; do for f in $p/fd/*; do t=$(readlink $f 2>/dev/null); case \"$t\" in *ttyACM*|*wheeltec*) echo \"${p#/proc/} $(cat $p/comm 2>/dev/null) -> $t\";; esac; done; done 2>/dev/null | head -20"),
+            'ip_serial':run('systemctl is-active ip_serial_sender 2>&1; systemctl status ip_serial_sender --no-pager 2>&1 | head -12'),
+            'usb_recent':run('dmesg 2>/dev/null | tail -40 | grep -iE "tty|usb|acm|disconnect|reset" | tail -15'),
+            'driver_log':run('tail -25 /home/wheeltec/mumai-console/runtime/logs/robot.log 2>/dev/null | grep -aiE "serial|wheeltec_robot|SerialException" | tail -10'),
+        }
+        with self.lock:self.serial_state={k:v[-1200:] for k,v in info.items()}
+        return dict(self.serial_state)
 
     def action_ready(self,client,name):
         """动作服务是否可用（server_is_ready 或主动 wait_for_server 探测）。
@@ -748,7 +780,7 @@ class RosBridge(Node):
                 handle=self.goal_handle;self.goal_handle=None
             try:
                 if handle:handle.cancel_goal_async()
-                for _ in range(5):self.stop_pub.publish(Twist())
+                await self._publish_stop()
             except Exception:pass
             return
         # 卡住 → 跳过当前航点继续（比原地等恢复动作快得多）
@@ -830,7 +862,7 @@ class RosBridge(Node):
                 handle=self.goal_handle;self.goal_handle=None;self.pending_goal=None
             try:
                 if handle:handle.cancel_goal_async()
-                for _ in range(5):self.stop_pub.publish(Twist())
+                await self._publish_stop()
             except Exception:pass
             self.relocalize_state.update({'reason':'stopped','at':now})
             return

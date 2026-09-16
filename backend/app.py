@@ -133,7 +133,7 @@ class Console:
         state=self.bridge.snapshot()
         state.update({'schema_version':'1.0','device_id':self.config['device_id'],'sampled_at':time.time(),'simulated':self.simulate,'metrics':dict(self.metrics),'active_map_id':self.active_map_id,'transition':self.transition,'max_speed_mps':self.config['max_speed_mps'],
                       'platform':{'state':self.uplink.state,'last_success':self.uplink.last_success,'error':self.uplink.error},
-                      'avoidance':getattr(self.bridge,'avoidance_state',{'enabled':True}),'mapping':self.mapping_status(),'rviz_active':bool(self.media and self.media.rviz_active()),'streams':{'rviz':'/api/streams/rviz.mjpeg','camera':'/api/streams/camera.mjpeg','rviz_state':('online' if self.media and time.time()-self.media.rviz_at<3 else 'offline'),'rtmp':self.media.rtmp if self.media else {}},'last_error':self.last_error})
+                      'avoidance':getattr(self.bridge,'avoidance_state',{'enabled':True}),'serial':getattr(self.bridge,'serial_state',{}),'mapping':self.mapping_status(),'rviz_active':bool(self.media and self.media.rviz_active()),'streams':{'rviz':'/api/streams/rviz.mjpeg','camera':'/api/streams/camera.mjpeg','rviz_state':('online' if self.media and time.time()-self.media.rviz_at<3 else 'offline'),'rtmp':self.media.rtmp if self.media else {}},'last_error':self.last_error})
         return state
 
     async def websocket(self,req):
@@ -236,6 +236,8 @@ class Console:
             if self.bridge.mode!='navigation':raise ConsoleError('NOT_NAVIGATING','请先加载巡航地图')
             if self.bridge.mission['state'] in ('running','accepting','paused','pausing','stopping'):raise ConsoleError('MISSION_ACTIVE','请先停止巡航')
             self.start_auto_localize();return {'ok':True,'state':'localizing'}
+        if key==('diagnostics','serial'):
+            return {'ok':True,'serial':self.bridge.serial_snapshot()}
         if key==('media','rviz'):
             active=body.get('active')
             if not isinstance(active,bool):raise ConsoleError('INVALID_ARGUMENT','active 需要 true/false',422)
@@ -423,7 +425,15 @@ class Console:
                     if (self.bridge.snapshot().get('chassis') or {}).get('state')=='online':
                         self._chassis_down_since=None;continue
                     self._chassis_restart_at=time.monotonic()
-                    self.last_error='底盘串口无数据（驱动可能已退出），正在自动重启底盘；请同时检查串口线/USB 与底盘供电'
+                    # 掉线瞬间抓现场：谁占着串口、USB 有没有重置、ip_serial_sender 是否在跑
+                    try:
+                        snap=self.bridge.serial_snapshot()
+                        path=self.root/'runtime'/'logs'/('serial-drop-'+time.strftime('%m%d-%H%M%S')+'.log')
+                        path.write_text('\n\n'.join(f'===== {k} =====\n{v}' for k,v in snap.items()))
+                        self.last_error=f'底盘串口无数据，正在自动重启底盘；现场已存 {path.name}（含占用串口的进程与 USB 日志）'
+                    except Exception as e:
+                        self.last_error='底盘串口无数据（驱动可能已退出），正在自动重启底盘；请检查串口线/USB'
+
                     await self.safe_stop()
                     if self.bridge.mode=='navigation' and self.active_map_id:
                         item,_=self.maps.load(self.active_map_id)
