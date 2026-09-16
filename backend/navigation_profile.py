@@ -5,6 +5,31 @@ from pathlib import Path
 from core import circle_footprint, footprint_center, footprint_text
 
 
+def available_mppi_critics():
+    """当前安装的 MPPI 提供了哪些 critic（读插件描述文件）；读不到就返回空集合。
+
+    这台车的 nav2_mppi_controller 是 Humble 版本，只有 9 个 critic，
+    没有 VelocityDeadbandCritic / CostCritic。写进配置不存在的插件会让
+    controller_server configure 失败，连累整个 Navi2 bringup 起不来。"""
+    global _MPPI_CRITICS
+    if _MPPI_CRITICS is not None: return _MPPI_CRITICS
+    import glob, re as _re
+    found = set()
+    for pattern in ('/home/wheeltec/wheeltec_ros2/install/nav2_mppi_controller/share/nav2_mppi_controller/critics.xml',
+                    '/opt/ros/*/share/nav2_mppi_controller/critics.xml',
+                    '/home/wheeltec/wheeltec_ros2/src/**/critics.xml'):
+        for path in glob.glob(pattern, recursive=True):
+            try:
+                found |= set(_re.findall(r'mppi::critics::([A-Za-z]+Critic)', open(path).read()))
+            except OSError:
+                continue
+    _MPPI_CRITICS = found
+    return found
+
+
+_MPPI_CRITICS = None
+
+
 def apply_forward_profile(cfg,root,arrival_radius=.25,clearance=.30):
     """前向导航配置 + 连续巡航行为树。
 
@@ -65,14 +90,17 @@ def apply_forward_profile(cfg,root,arrival_radius=.25,clearance=.30):
     goal_checker=cfg['controller_server']['ros__parameters'].setdefault('goal_checker',{})
     goal_checker.update({'xy_goal_tolerance':stop_radius,'yaw_goal_tolerance':3.141592653589793,'stateful':True})
     controller.setdefault('GoalAngleCritic',{})['enabled']=False
-    # MPPI 加速度死区：抑制“一点点前进 + 左右修方向”的持续微调（轮子一直在响）
+    # MPPI 加速度死区：抑制“一点点前进 + 左右修方向”的持续微调。
+    # 只有当前构建确实提供该 critic 时才加——加不存在的插件会让控制器 configure 直接 FATAL，
+    # 进而 lifecycle_manager 中止整个 Nav2 bringup（预览直接超时）。
     follow=cfg['controller_server']['ros__parameters'].setdefault('FollowPath',{})
     critics=list(follow.get('critics') or [])
-    if critics and 'VelocityDeadbandCritic' not in critics:
-        critics.insert(critics.index('GoalCritic') if 'GoalCritic' in critics else len(critics),'VelocityDeadbandCritic')
-        follow['critics']=critics
-    follow.setdefault('VelocityDeadbandCritic',{}).update({'enabled':True,'cost_power':1,'cost_weight':1.0,
-                                                           'deadband_velocity':[.05,0.,.2]})
+    if critics and 'VelocityDeadbandCritic' in available_mppi_critics():
+        if 'VelocityDeadbandCritic' not in critics:
+            critics.insert(critics.index('GoalCritic') if 'GoalCritic' in critics else len(critics),'VelocityDeadbandCritic')
+            follow['critics']=critics
+        follow.setdefault('VelocityDeadbandCritic',{}).update({'enabled':True,'cost_power':1,'cost_weight':1.0,
+                                                               'deadband_velocity':[.05,0.,.2]})
     return cfg
 
 

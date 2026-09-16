@@ -56,16 +56,26 @@ class ForwardProfileTests(unittest.TestCase):
   self.assertEqual(cfg['controller_server']['ros__parameters']['goal_checker']['xy_goal_tolerance'],.20)
   bt=ET.parse(root/'runtime/behavior_trees/continuous_navigation.xml').getroot()
   self.assertEqual(bt.find('.//RemovePassedGoals').get('radius'),'0.08')
- def test_velocity_deadband_critic_is_added(self):
+ def test_never_adds_critic_missing_from_build(self):
+  """构建里没有的 critic 绝不能写进配置：会让 controller_server FATAL 并中止整个 bringup。"""
+  import navigation_profile as np
   root=Path(__file__).resolve().parents[1]
   cfg={'planner_server':{'ros__parameters':{'GridBased':{}}},'controller_server':{'ros__parameters':{'FollowPath':{'critics':['GoalCritic','PathFollowCritic']}}},'bt_navigator':{'ros__parameters':{}}}
-  apply_forward_profile(cfg,root,.08)
-  follow=cfg['controller_server']['ros__parameters']['FollowPath']
-  self.assertIn('VelocityDeadbandCritic',follow['critics'])
-  self.assertTrue(follow['VelocityDeadbandCritic']['enabled'])
-  self.assertEqual(follow['VelocityDeadbandCritic']['deadband_velocity'][0],.05)
-  apply_forward_profile(cfg,root,.08)                      # 幂等：重复调用不重复插入
-  self.assertEqual(follow['critics'].count('VelocityDeadbandCritic'),1)
+  saved=np._MPPI_CRITICS
+  try:
+   np._MPPI_CRITICS=set()
+   apply_forward_profile(cfg,root,.08)
+   follow=cfg['controller_server']['ros__parameters']['FollowPath']
+   self.assertEqual(follow['critics'],['GoalCritic','PathFollowCritic'])
+   self.assertNotIn('VelocityDeadbandCritic',follow)
+   np._MPPI_CRITICS={'GoalCritic','VelocityDeadbandCritic'};cfg['controller_server']['ros__parameters']['FollowPath']['critics']=['GoalCritic','PathFollowCritic']
+   apply_forward_profile(cfg,root,.08)
+   self.assertIn('VelocityDeadbandCritic',follow['critics'])
+   self.assertEqual(follow['critics'].count('VelocityDeadbandCritic'),1)
+   apply_forward_profile(cfg,root,.08)
+   self.assertEqual(follow['critics'].count('VelocityDeadbandCritic'),1)   # 幂等
+  finally:
+   np._MPPI_CRITICS=saved
  def test_arrival_radius_is_configurable(self):
   root=Path(__file__).resolve().parents[1]
   cfg={'planner_server':{'ros__parameters':{'GridBased':{}}},'controller_server':{'ros__parameters':{'FollowPath':{}}},'bt_navigator':{'ros__parameters':{}}}

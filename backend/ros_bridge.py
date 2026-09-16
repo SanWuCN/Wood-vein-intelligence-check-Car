@@ -294,6 +294,21 @@ class RosBridge(Node):
             self.refine_state.update({'reason':'waiting_data','applied':False,'idle_s':0.,'checked_at':None})
         self.buffer.clear()
 
+    def nav_stack_up(self):
+        """导航栈活着 = 巡航模式 + 地图已加载 + 雷达在出数（scan 新鲜）。"""
+        with self.lock:
+            return bool(self.mode=='navigation' and self.map_meta is not None and time.time()-self.scan_at<3)
+
+    def action_ready(self,client,name):
+        """动作服务是否可用（server_is_ready 或主动 wait_for_server 探测）。
+
+        注意 rclpy 的 Node 没有 get_action_names_and_types()，早先那版回退分支等于永远 False。"""
+        try:
+            if client.server_is_ready():return True
+        except Exception:pass
+        try:return bool(client.wait_for_server(timeout_sec=.5))
+        except Exception:return False
+
     def localized(self):
         with self.lock:
             return bool(self.mode=='navigation' and self.amcl and self.pose and time.time()-self.scan_at<2
@@ -482,7 +497,11 @@ class RosBridge(Node):
         if start_conflict(meta,grid,pose,self.clearance):
             raise ConsoleError('START_BLOCKED',f'当前位置离障碍不足 {self.clearance:g} m（或与地图不符），请把车移开一些再预览',409)
         self.plan=[]
-        if not self.planner.server_is_ready():raise ConsoleError('NAV_NOT_READY','路径规划器未就绪')
+        # 注意：这台机器上 ROS 2 的动作发现不可靠（新建 ActionClient 的 wait_for_server 也探不到
+        # /compute_path_through_poses，尽管 ros2 action list 里有）。所以不拿它当门禁，
+        # 直接发目标；真正连不上时下面会给出明确错误。
+        if not self.planner.server_is_ready() and not self.planner.wait_for_server(timeout_sec=1.0):
+            self.get_logger().warning('规划器动作未发现，仍尝试直接发送目标')
         goals=automatic_goals(points,pose,mode)
         route=prune_reached_goals(goals+([goals[0]] if mode=='loop' else []),pose,self.arrival_radius)
         if not route:raise ConsoleError('NO_PATH','起点已覆盖全部航点，请调整航点或先移动小车',409)
@@ -765,7 +784,10 @@ class RosBridge(Node):
         with self.lock:
             return {'mode':self.mode,'uptime_s':int(now-self.started_at),'map':self.map_meta,
                     'pose':self.pose if now-self.pose_at<2 else None,'scan_points':self.scan_points,'path':self.plan,
-                    'navigation':{'ready':self.nav.server_is_ready(),'planner_ready':self.planner.server_is_ready()},
+                    # 就绪判断只用能直接观测到的信号：动作服务发现（ActionClient）在
+                    # 服务端重启后经常一直为 False，界面会卡在“导航初始化”导致预览点不了。
+                    # 导航栈活着 = 巡航模式 + 地图已加载 + 雷达在出数。
+                    'navigation':{'ready':self.nav_stack_up(),'planner_ready':self.nav_stack_up()},
                     'localization':{'ready':self.localized(),'match':self.match,'refine':dict(self.refine_state),'relocalize':dict(self.relocalize_state),'aruco':dict(self.aruco_state),'amcl_received':self.amcl is not None,'match_age_s':age(self.match_at),'covariance':{'x_m2':self.amcl['covariance'][0],'y_m2':self.amcl['covariance'][7],'yaw_rad2':self.amcl['covariance'][35]} if self.amcl else None},
                     'velocity':self.odom if now-self.odom_at<2 else None,
                     'imu':self.imu if now-self.imu_at<2 else None,'imu_history':list(self.imu_history),
