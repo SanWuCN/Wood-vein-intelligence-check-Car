@@ -7,7 +7,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'backend'))
 from core import (MAP_SAVE_TOLERANCE, ConsoleError, circle_footprint, footprint_center, footprint_points, footprint_text,
                   grid_diff_ratio, infeasible_turn_ratio, lap_number, missed_waypoint, path_min_radius, plan_batch,
-                  points_within, relocalize_decision, should_backup_map, simplify_path,
+                  plan_leads_away, points_within, relocalize_decision, should_backup_map, simplify_path, stalled_here,
                   prune_reached_goals, record_step, remaining_route_distance, start_conflict,
                   validate_waypoints, waypoint_index)
 
@@ -278,3 +278,30 @@ class RelocalizeDecisionTests(unittest.TestCase):
             self.assertEqual(relocalize_decision(self.base(mission=mission), 120.), ('wait', 'mission'))
         self.assertEqual(relocalize_decision(self.base(enabled=False), 120.), ('wait', 'disabled'))
         self.assertEqual(relocalize_decision(self.base(match=None), 120.), ('wait', 'no_match'))
+
+
+class SkipCirclingTests(unittest.TestCase):
+    """兜圈就跳过：越过 / 停在点旁 / 规划要掉头，三种情况都去下一个点。"""
+
+    def test_plan_leads_away_detects_u_turn(self):
+        robot = {'x': 0., 'y': 0.}
+        target = {'x': .4, 'y': 0.}                       # 目标在正前方 0.4m
+        forward = [{'x': .2, 'y': 0.}, {'x': .6, 'y': 0.}, {'x': 1., 'y': 0.}]
+        self.assertFalse(plan_leads_away(forward, robot, target))
+        u_turn = [{'x': -.2, 'y': .1}, {'x': -.6, 'y': .2}, {'x': -.2, 'y': .4}]   # 先往反方向绕
+        self.assertTrue(plan_leads_away(u_turn, robot, target))
+
+    def test_plan_leads_away_ignores_far_targets(self):
+        robot = {'x': 0., 'y': 0.}
+        target = {'x': 3., 'y': 0.}                       # 目标很远时不做这个判断
+        u_turn = [{'x': -.3, 'y': 0.}, {'x': -1., 'y': 0.}]
+        self.assertFalse(plan_leads_away(u_turn, robot, target))
+        self.assertFalse(plan_leads_away([], robot, target))
+        self.assertFalse(plan_leads_away(u_turn, None, target))
+
+    def test_stalled_here_requires_no_motion_and_time(self):
+        ref = (1., 1.)
+        self.assertTrue(stalled_here(ref, {'x': 1.01, 'y': 1.01, 'speed': 0.}, 3.))
+        self.assertFalse(stalled_here(ref, {'x': 1.01, 'y': 1.01, 'speed': 0.}, 1.))   # 时间不够
+        self.assertFalse(stalled_here(ref, {'x': 1.4, 'y': 1.0, 'speed': 0.}, 3.))     # 已经走开了
+        self.assertFalse(stalled_here(ref, {'x': 1.01, 'y': 1.01, 'speed': .2}, 3.))   # 还在动

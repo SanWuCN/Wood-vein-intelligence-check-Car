@@ -574,3 +574,31 @@ def relocalize_decision(state, now):
     if now - (state.get('last_at') or 0.) < state.get('interval_s', 5.): return 'wait', 'wait'
     if state.get('count', 0) >= state.get('max_count', 4): return 'stop', 'exhausted'
     return 'anchor', 'low'
+
+
+def plan_leads_away(plan, robot, target, probe_m=.5, min_angle_deg=120.):
+    """规划路径开头是不是朝目标的反方向走（说明必须先掉头/绕圈才能过去）。
+
+    只在目标很近（<1.2 m）时才有意义：用“路径前 probe_m 米的方向”与
+    “车指向目标的方向”比较，夹角过大就说明这个点要靠兜圈才能到。"""
+    if not plan or not robot or not target: return False
+    dx, dy = target['x'] - robot['x'], target['y'] - robot['y']
+    straight = math.hypot(dx, dy)
+    if straight > 1.2 or straight < 1e-6: return False
+    probe = None
+    for point in plan:
+        if math.hypot(point['x'] - robot['x'], point['y'] - robot['y']) >= probe_m:
+            probe = point; break
+    if probe is None: probe = plan[-1]
+    px, py = probe['x'] - robot['x'], probe['y'] - robot['y']
+    if math.hypot(px, py) < 1e-6: return False
+    cos = (px * dx + py * dy) / (math.hypot(px, py) * straight)
+    angle = math.degrees(math.acos(max(-1., min(1., cos))))
+    return angle > min_angle_deg
+
+
+def stalled_here(previous, robot, seconds, limit_s=2.5, move_m=.05, still_mps=.03):
+    """车是不是停在原地：距 previous 参考点位移很小、速度接近 0，且持续足够久。"""
+    if not robot or not previous or seconds < limit_s: return False
+    speed = abs(robot.get('speed') or 0.)
+    return speed <= still_mps and math.hypot(robot['x'] - previous[0], robot['y'] - previous[1]) <= move_m

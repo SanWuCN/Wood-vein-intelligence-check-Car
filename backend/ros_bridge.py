@@ -26,7 +26,7 @@ from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 from cv_bridge import CvBridge
 import cv2
 from core import (ConsoleError, automatic_goals, bounds, grid_likelihood, idle_refine_decision, lap_number, missed_waypoint,
-                  relocalize_decision,
+                  plan_leads_away, relocalize_decision, stalled_here,
                     map_image, plan_batch, points_within, prune_reached_goals, record_step, remaining_route_distance, start_conflict,
                     validate_waypoints, waypoint_index,
                     world_to_cell, snap_pose as core_snap_pose)
@@ -69,6 +69,11 @@ class RosBridge(Node):
         self.lookahead_max=int(config.get('cruise_lookahead_max_points',40) or 0)
         self.skip_missed=bool(config.get('skip_missed_points',True))
         self._skipping=False;self._last_skip_at=0.
+        # “兜圈就跳过”：越过、停在点旁不动、或规划一开头就朝反方向走，都直接去下一个点
+        self.skip_near=float(config.get('cruise_skip_near_m',.30))
+        self.skip_stall=float(config.get('cruise_skip_stall_s',2.5))
+        self.skip_detour=float(config.get('cruise_skip_detour_deg',120.))
+        self._stall_ref=None;self._stall_since=None
         # 航行中定位守护：吻合度持续偏低时小窗口吸附重锚，连续失败则安全停车
         self.relocalize_enabled=bool(config.get('cruise_relocalize',True))
         self.relocalize_match=float(config.get('cruise_relocalize_match',.55))
@@ -492,7 +497,7 @@ class RosBridge(Node):
             self.navigation_goals=automatic_goals(points,self.pose,mode)
             self.route_cursor=0
             self.epoch+=1
-            self.mission={'state':'accepting','index':0,'cycle':0,'points':points,'mode':mode,'distance_remaining':None,'skipped':0,'abort_reason':None}
+            self.mission={'state':'accepting','index':0,'cycle':0,'points':points,'mode':mode,'distance_remaining':None,'skipped':0,'skip_reason':None,'abort_reason':None}
             self.error=None;self.publish_speed();self._send_nav(self.epoch)
             return dict(self.mission)
 
@@ -538,10 +543,13 @@ class RosBridge(Node):
         f.add_done_callback(accepted)
 
     def mission_skip_tick(self):
-        """目标航点已被越过却没进到达半径（点密集时常见）：跳过它，去下一个点修正。
+        """当前航点要不要跳过（用户要求：兜圈子就直接去下一个点）。
 
-        直接取消当前动作会短暂减速，但比让规划器绕回身后的点兜一大圈好得多。
-        取消结果由 _finished 接住（status≠4 且 _skipping=True）后从下一个点续跑。"""
+        三种情况都算：
+          A 已经越过该点（点密集时擦肩而过）；
+          B 车已停在该点附近却迟迟到不了（比如点落在 30cm 禁区里永远进不去）；
+          C 规划出来的路径一开头就朝反方向走（要先掉头/绕圈）。
+        动作是取消当前动作并从下一个点续跑，代价是短暂减速，换来不兜圈。"""
         if not self.skip_missed:return
         with self.lock:
             if self._skipping or self.mission['state'] not in ('running','accepting'):return
@@ -554,8 +562,22 @@ class RosBridge(Node):
             target=goals[index]
             prev=goals[(index-1)%n] if loop else (goals[index-1] if index else None)
             direction=(target['x']-prev['x'],target['y']-prev['y']) if prev else None
-            if not missed_waypoint(pose,target,direction,self.arrival_radius):return
-            self._skipping=True;self._last_skip_at=time.time();handle=self.goal_handle
+            plan=list(self.plan)
+            speed=abs((self.odom or {}).get('linear_mps') or 0.)
+            distance=math.hypot(pose['x']-target['x'],pose['y']-target['y'])
+            # 停滞判定：以“进入目标附近”那一刻的位置为参考点
+            if distance>self.skip_near:self._stall_ref=None;self._stall_since=None
+            elif self._stall_ref is None:self._stall_ref=(pose['x'],pose['y']);self._stall_since=time.time()
+            stalled=stalled_here(self._stall_ref,{'x':pose['x'],'y':pose['y'],'speed':speed},
+                                 time.time()-(self._stall_since or time.time()),self.skip_stall)
+            reason=None
+            if missed_waypoint(pose,target,direction,self.arrival_radius):reason='越过'
+            elif stalled and distance<=self.skip_near:reason='停在点旁到不了'
+            elif plan_leads_away(plan,pose,target,min_angle_deg=self.skip_detour):reason='规划要掉头兜圈'
+            if not reason:return
+            self._skipping=True;self._last_skip_at=time.time()
+            self.mission['skip_reason']=reason
+            handle=self.goal_handle
         try:handle.cancel_goal_async()
         except Exception:
             with self.lock:self._skipping=False
