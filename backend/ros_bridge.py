@@ -65,6 +65,8 @@ class RosBridge(Node):
         # 连续巡航：每批下发的目标点数（0=mult 全部剩余 / loop 一圈减一段）
         self.lookahead=int(config.get('cruise_lookahead',4) or 0)
         self.arrival_radius=float(config.get('cruise_arrival_radius',.20))
+        self.config_clearance=float(config.get('cruise_clearance',.22))
+        self.footprint_center_cache=(.089,0.)      # 车体几何中心，加载地图时由 app 用真实足迹更新
         # 密集航点（录制每 10 cm 一个点）：窗口按距离补足，避免每几个点就停一次
         self.lookahead_m=float(config.get('cruise_lookahead_m',2.5) or 0.)
         self.lookahead_max=int(config.get('cruise_lookahead_max_points',40) or 0)
@@ -93,7 +95,7 @@ class RosBridge(Node):
         self.relocalize_state={'enabled':self.relocalize_enabled,'count':0,'reason':'disabled','match':None,
                                'shift_m':None,'shift_deg':None,'at':None}
         self._match_low_since=None;self._last_relocalize_at=0.
-        self.clearance=float(config.get('cruise_clearance',.30))
+        self.clearance=float(config.get('cruise_clearance',.22))
         self._like=None;self._like_rev=None
         # 航迹记录（遥控教学）：每 record_step_m 米记一个点，直接可存成路线
         self.record_step_m=float(config.get('record_step_m',.2))
@@ -132,6 +134,15 @@ class RosBridge(Node):
         sub(Twist,'/cmd_vel',self.on_command,10)
         self.initial_pub=self.create_publisher(PoseWithCovarianceStamped,'/initialpose',10)
         self.stop_pub=self.create_publisher(Twist,'/cmd_vel',10)
+        # “关避障/贴线巡航”开关：通过参数服务实时改代价地图（不用重启导航栈）
+        try:
+            from rcl_interfaces.srv import SetParameters
+            self.costmap_param_clients=[self.create_client(SetParameters,n) for n in
+                                        ('/global_costmap/global_costmap/set_parameters','/local_costmap/local_costmap/set_parameters')]
+        except Exception:
+            self.costmap_param_clients=[]
+        self.avoidance=bool(config.get('cruise_avoidance',True))
+        self.avoidance_state={'enabled':self.avoidance}
         self.speed_pub=self.create_publisher(SpeedLimit,'/speed_limit',QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.nav=ActionClient(self,NavigateThroughPoses,'/navigate_through_poses')
         self.planner=ActionClient(self,ComputePathThroughPoses,'/compute_path_through_poses')
@@ -294,6 +305,28 @@ class RosBridge(Node):
             self.refine_state.update({'reason':'waiting_data','applied':False,'idle_s':0.,'checked_at':None})
         self.buffer.clear()
 
+    async def set_avoidance(self,enabled):
+        """开关避障：贴线模式把硬禁区收到车体本身、膨胀收到 0.20 m，并实时下发到两个代价地图。"""
+        from rcl_interfaces.msg import Parameter as _P,ParameterValue as _PV,ParameterType as _PT
+        if enabled:
+            clearance=float(self.config_clearance);inflation=max(clearance*1.5,.45)
+        else:
+            clearance=.10;inflation=.20      # 贴线模式：致命区≈车体本身
+        footprint=footprint_text(circle_footprint(clearance,self.footprint_center_cache or (0.,0.)))
+        applied=[]
+        for client in self.costmap_param_clients:
+            if not client.service_is_ready() and not client.wait_for_service(timeout_sec=1.0):continue
+            req=SetParameters.Request()
+            req.parameters=[_P(name='footprint',value=_PV(type=_PT.PARAMETER_STRING,string_value=footprint)),
+                            _P(name='inflation_layer.inflation_radius',value=_PV(type=_PT.PARAMETER_DOUBLE,double_value=inflation))]
+            try:
+                fut=client.call_async(req);await ros_future(fut,3.);applied.append(True)
+            except Exception:applied.append(False)
+        with self.lock:self.avoidance=bool(enabled)
+        self.avoidance_state={'enabled':bool(enabled),'clearance':clearance,'inflation':inflation,
+                              'services':len(applied),'ok':all(applied) if applied else False}
+        return dict(self.avoidance_state)
+
     def nav_stack_up(self):
         """导航栈活着 = 巡航模式 + 地图已加载 + 雷达在出数（scan 新鲜）。"""
         with self.lock:
@@ -316,6 +349,10 @@ class RosBridge(Node):
             return best
         except Exception:return None
 
+    def active_clearance(self):
+        """当前生效的硬禁区半径（关避障后≈车体半宽）。"""
+        return self.config_clearance if self.avoidance else .10
+
     async def nudge_clear_of_obstacles(self,max_bursts=14,speed=.06,burst_s=.5):
         """起步位置太靠障碍时先倒车让出空间。
 
@@ -325,7 +362,7 @@ class RosBridge(Node):
         for step in range(max_bursts):
             with self.lock:
                 pose=self.pose;meta=self.map_meta;grid=self.grid
-            if not pose or not start_conflict(meta,grid,pose,self.clearance):
+            if not pose or not start_conflict(meta,grid,pose,self.active_clearance()):
                 return step
             rear=self.rear_clearance()
             # 倒车前必须先看后方：没有雷达数据或后方不足 0.45 m 就不倒，宁可报错让用户挪车
@@ -534,13 +571,13 @@ class RosBridge(Node):
             points=validate_waypoints(points,self.map_meta,self.grid,mode)
             pose=self.pose;meta=self.map_meta;grid=self.grid
         nudged=0
-        if start_conflict(meta,grid,pose,self.clearance):
+        if start_conflict(meta,grid,pose,self.active_clearance()):
             # 离墙太近 → 先倒车让位再规划（规划器无法从致命栅格起步）
             nudged=await self.nudge_clear_of_obstacles()
             with self.lock:pose=self.pose;meta=self.map_meta;grid=self.grid
-            if start_conflict(meta,grid,pose,self.clearance):
+            if start_conflict(meta,grid,pose,self.active_clearance()):
                 raise ConsoleError('START_BLOCKED',
-                    f'已尝试倒车让位（{nudged*3} cm）但车仍离障碍不足 {self.clearance:g} m，请手动挪车后再预览',409)
+                    f'已尝试倒车让位（{nudged*3} cm）但车仍离障碍不足 {self.active_clearance():g} m，请手动挪车后再预览',409)
             points=validate_waypoints(points,meta,grid,mode)
         self.nudged_cm=nudged*3
         self.plan=[]
@@ -573,16 +610,16 @@ class RosBridge(Node):
             if not self.localized():raise ConsoleError('NOT_LOCALIZED','请先完成定位')
             if not self.nav.server_is_ready():raise ConsoleError('NAV_NOT_READY','导航服务未就绪')
             # 先让位再校验（校验会因起点落在障碍/未知区而拒绝）
-            if start_conflict(self.map_meta,self.grid,self.pose,self.clearance):
+            if start_conflict(self.map_meta,self.grid,self.pose,self.active_clearance()):
                 await self.nudge_clear_of_obstacles()
-                if start_conflict(self.map_meta,self.grid,self.pose,self.clearance):
+                if start_conflict(self.map_meta,self.grid,self.pose,self.active_clearance()):
                     raise ConsoleError('START_BLOCKED',
-                        f'已尝试倒车让位但车仍离障碍不足 {self.clearance:g} m，请手动挪车后再开始巡航',409)
+                        f'已尝试倒车让位但车仍离障碍不足 {self.active_clearance():g} m，请手动挪车后再开始巡航',409)
             points=validate_waypoints(points,self.map_meta,self.grid,mode)
             self.navigation_goals=automatic_goals(points,self.pose,mode)
             self.route_cursor=0
             self.epoch+=1
-            self.mission={'state':'accepting','index':0,'cycle':0,'points':points,'mode':mode,'distance_remaining':None,'skipped':0,'skip_reason':None,'abort_reason':None}
+            self.mission={'state':'accepting','index':0,'cycle':0,'points':points,'mode':mode,'distance_remaining':None,'skipped':0,'skip_reason':None,'abort_reason':None,'stop_reason':None}
             self.error=None;self.publish_speed();self._send_nav(self.epoch)
             return dict(self.mission)
 
@@ -723,10 +760,16 @@ class RosBridge(Node):
                     self._send_nav(self.epoch)
                     return
                 self.mission['state']='failed'
-                # 控制器报“无法前进”时吻合度往往偏低，据此把原因说清楚
-                self.mission['abort_reason']='progress' if (self.match or 1.)<self.relocalize_match else 'unknown'
-                self.error=('导航被中止：车没能继续前进（多为前方被挡住，或定位偏差导致路径不可行），已停车'
-                            if self.mission['abort_reason']=='progress' else '导航未完成，已停车')
+                with self.lock:
+                    blocked=start_conflict(self.map_meta,self.grid,self.pose,self.active_clearance())
+                    empty=not self.plan
+                    match=self.match;skipped=self.mission.get('skipped') or 0
+                    skip_reason=self.mission.get('skip_reason')
+                self.mission['abort_reason']='start_blocked' if blocked else ('no_path' if empty else 'aborted')
+                self.mission['stop_reason']=mission_stop_reason(start_blocked=blocked,plan_empty=empty,match=match,
+                                                               status=status,skipped=skipped,skip_reason=skip_reason,
+                                                               clearance=self.active_clearance())
+                self.error='已停车：'+self.mission['stop_reason']
                 return
             self.pending_goal=None
             # 一批可能覆盖多个航点：整批走完才推进游标

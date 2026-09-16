@@ -665,3 +665,23 @@ def missing_chassis_parts(state):
     if not state.get('imu'): gaps.append('IMU /imu/data_raw')
     if (state.get('chassis') or {}).get('state') != 'online': gaps.append('底盘原始数据')
     return gaps
+
+
+def mission_stop_reason(*, start_blocked=False, plan_empty=False, match=None, moved=None,
+                        status=None, skipped=0, skip_reason=None, clearance=.22, min_match=.45):
+    """把"为什么停下"翻译成一句人话，给前端显示。
+
+    规划器/PBT 的原始原因控制台看不到（行为树内部调用），所以这里按可观测信号反推。"""
+    if start_blocked:
+        return f'车离障碍/墙太近（不足 {clearance:g} m），规划器无法从当前位置起步；已尝试倒车让位，仍不行请手动挪车'
+    if plan_empty:
+        return '规划器没有找到可行路径：前方被挡、或地图与现场不一致（可考虑“关避障/贴线巡航”）'
+    if match is not None and match < min_match:
+        return f'定位吻合度过低（{int(match*100)}%），已安全停车；请重新定位或重新建图'
+    if moved is False:
+        return '车没有前进：被障碍挡住，或路径在当前代价地图下不可行'
+    if status in (5, 2):
+        return '任务被取消'
+    if skipped and skip_reason:
+        return f'航点连续无法到达（最近一次跳过原因：{skip_reason}），导航中止'
+    return '导航被中止（原因见日志：多为路径不可行或传感器/底盘数据异常）'

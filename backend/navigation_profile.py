@@ -30,7 +30,7 @@ def available_mppi_critics():
 _MPPI_CRITICS = None
 
 
-def apply_forward_profile(cfg,root,arrival_radius=.20,clearance=.22,min_turn_radius=.30):
+def apply_forward_profile(cfg,root,arrival_radius=.20,clearance=.22,min_turn_radius=.30,avoidance=True):
     """前向导航配置 + 连续巡航行为树。
 
     arrival_radius 是“算作到达航点”的半径（行为树的经过半径用它；终点停靠容差另取，见下），
@@ -70,6 +70,14 @@ def apply_forward_profile(cfg,root,arrival_radius=.20,clearance=.22,min_turn_rad
     target=runtime/'continuous_navigation.xml';target.write_text(rendered)
     cfg['bt_navigator']['ros__parameters']['default_nav_through_poses_bt_xml']=str(target)
     clearance=max(.05,min(float(clearance),1.5))
+    if not avoidance:
+        # 贴线巡航（用户要求“把致命栅格关了”）：硬禁区收到车体半宽（0.10 m），
+        # 于是"内切/致命"只存在于障碍本身附近，规划器不会因为贴近墙而拒绝起步；
+        # 软避让只留 0.20 m 薄薄一层代价，路径会贴着教学线走。碰撞风险由用户承担。
+        clearance=.10
+        inflation_radius=.20
+    else:
+        inflation_radius=max(clearance*1.5,.45)
     for node in ('global_costmap','local_costmap'):
         params=_costmap_params(cfg,node)
         if params is None:continue
@@ -80,7 +88,7 @@ def apply_forward_profile(cfg,root,arrival_radius=.20,clearance=.22,min_turn_rad
         layer['enabled']=True
         # 硬禁区（内切半径=足迹半径）要小，否则车稍微靠近墙就“起点在致命区”导致规划失败；
         # 软避让（膨胀）留大，规划器仍会主动挑 ≥45 cm 的通道。
-        layer['inflation_radius']=round(max(clearance*1.5,.45),2)
+        layer['inflation_radius']=round(inflation_radius,2)
         layer.setdefault('cost_scaling_factor',3.0)
     # AMCL：默认参数在这个场地上偏保守——走 25 cm 才更新一次、自恢复被关死（收敛到错位置就回不来）
     amcl=cfg.setdefault('amcl',{}).setdefault('ros__parameters',{})

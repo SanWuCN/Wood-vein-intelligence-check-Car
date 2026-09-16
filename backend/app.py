@@ -16,7 +16,7 @@ import aiohttp
 from aiohttp import web
 import psutil
 import yaml
-from core import ConsoleError,MAP_SAVE_TOLERANCE,MapStore,chassis_restart_decision,finite,missing_chassis_parts,grid_diff_ratio,infeasible_turn_ratio,path_min_radius,pose_arg,should_backup_map,simplify_path,validate_waypoints,map_image
+from core import ConsoleError,MAP_SAVE_TOLERANCE,MapStore,chassis_restart_decision,finite,footprint_center,missing_chassis_parts,grid_diff_ratio,infeasible_turn_ratio,path_min_radius,pose_arg,should_backup_map,simplify_path,validate_waypoints,map_image
 from processes import Processes
 from navigation_profile import apply_forward_profile
 from uplink import Uplink
@@ -133,7 +133,7 @@ class Console:
         state=self.bridge.snapshot()
         state.update({'schema_version':'1.0','device_id':self.config['device_id'],'sampled_at':time.time(),'simulated':self.simulate,'metrics':dict(self.metrics),'active_map_id':self.active_map_id,'transition':self.transition,'max_speed_mps':self.config['max_speed_mps'],
                       'platform':{'state':self.uplink.state,'last_success':self.uplink.last_success,'error':self.uplink.error},
-                      'mapping':self.mapping_status(),'streams':{'rviz':'/api/streams/rviz.mjpeg','camera':'/api/streams/camera.mjpeg','rviz_state':('online' if self.media and time.time()-self.media.rviz_at<3 else 'offline'),'rtmp':self.media.rtmp if self.media else {}},'last_error':self.last_error})
+                      'avoidance':getattr(self.bridge,'avoidance_state',{'enabled':True}),'mapping':self.mapping_status(),'streams':{'rviz':'/api/streams/rviz.mjpeg','camera':'/api/streams/camera.mjpeg','rviz_state':('online' if self.media and time.time()-self.media.rviz_at<3 else 'offline'),'rtmp':self.media.rtmp if self.media else {}},'last_error':self.last_error})
         return state
 
     async def websocket(self,req):
@@ -236,6 +236,12 @@ class Console:
             if self.bridge.mode!='navigation':raise ConsoleError('NOT_NAVIGATING','请先加载巡航地图')
             if self.bridge.mission['state'] in ('running','accepting','paused','pausing','stopping'):raise ConsoleError('MISSION_ACTIVE','请先停止巡航')
             self.start_auto_localize();return {'ok':True,'state':'localizing'}
+        if key==('navigation','avoidance'):
+            enabled=body.get('enabled')
+            if not isinstance(enabled,bool):raise ConsoleError('INVALID_ARGUMENT','enabled 需要 true/false',422)
+            self.config['cruise_avoidance']=enabled;self.save_config()
+            state=await self.bridge.set_avoidance(enabled)
+            return {'ok':True,'avoidance':state}
         if key==('aruco','capture'):
             pose=self.bridge.aruco_capture()
             self.config['aruco']={**(self.config.get('aruco') or {}),'marker_pose':pose}
@@ -449,7 +455,11 @@ class Console:
                 params=None
                 if mode=='navigation':
                     source=Path(self.config['workspace'])/'install/wheeltec_nav2/share/wheeltec_nav2/param/wheeltec_params/param_mini_akm.yaml'
-                    cfg=apply_forward_profile(yaml.safe_load(source.read_text()),self.root,self.config.get('cruise_arrival_radius',.20),self.config.get('cruise_clearance',.30),self.config.get('min_turn_radius',.30));amcl=cfg['amcl']['ros__parameters'];amcl['set_initial_pose']=False
+                    cfg=apply_forward_profile(yaml.safe_load(source.read_text()),self.root,self.config.get('cruise_arrival_radius',.20),self.config.get('cruise_clearance',.22),self.config.get('min_turn_radius',.30),self.config.get('cruise_avoidance',True));amcl=cfg['amcl']['ros__parameters'];amcl['set_initial_pose']=False
+                    try:
+                        local=cfg['local_costmap']['local_costmap']['ros__parameters']
+                        self.bridge.footprint_center_cache=footprint_center(local.get('footprint'))
+                    except Exception:pass
                     params=self.root/'runtime/navigation.yaml';params.write_text(yaml.safe_dump(cfg,sort_keys=False))
                 await self.processes.stop_robot()
                 self.bridge.reset_localization();self.bridge.mode='idle'

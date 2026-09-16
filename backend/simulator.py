@@ -15,7 +15,7 @@ class SimBridge:
         self.grid[185:190,40:115]=100;self.grid[185:190,270:420]=100
         for x,y in [(235,105),(290,105),(235,255),(290,255)]:self.grid[y:y+12,x:x+12]=100
         self.map_meta={'width':460,'height':360,'resolution':.05,'origin':{'x':-11.5,'y':-9.,'yaw':0.},'bounds':bounds(self.grid),'frame_id':'map','revision':1}
-        self.map_revision=1;self.map_png=map_image(self.grid);self.pose={'x':0.,'y':0.,'yaw':.3};self.camera_jpeg=None;self.camera_at=0
+        self.avoidance_state={'enabled':True};self.map_revision=1;self.map_png=map_image(self.grid);self.pose={'x':0.,'y':0.,'yaw':.3};self.camera_jpeg=None;self.camera_at=0
         self.speed=config['default_speed_mps'];self.plan=[];self.ready=False
         self.mission={'state':'idle','points':[],'mode':'multi','index':0,'cycle':0,'distance_remaining':None}
     def snapshot_map(self):return dict(self.map_meta),self.grid.copy(),dict(self.pose)
