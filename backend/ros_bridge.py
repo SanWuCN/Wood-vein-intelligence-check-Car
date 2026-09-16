@@ -338,6 +338,21 @@ class RosBridge(Node):
         with self.lock:
             return bool(self.mode=='navigation' and self.map_meta is not None and time.time()-self.scan_at<3)
 
+    def front_clearance(self,limit=1.5,half_angle=30.):
+        """前方（±half_angle）最近障碍距离；无雷达数据返回 None。"""
+        with self.lock:
+            scan=self.last_scan
+        if scan is None:return None
+        try:
+            best=None;angle=scan.angle_min
+            for r in scan.ranges:
+                deg=math.degrees(angle);angle+=scan.angle_increment
+                if abs(deg)>half_angle:continue
+                if r is None or r!=r or r<=0 or r>=scan.range_max:continue
+                best=r if best is None else min(best,r)
+            return best
+        except Exception:return None
+
     def rear_clearance(self,limit=.45):
         """后方（±25°）最近障碍距离；没有雷达数据时返回 None（视为未知，不倒车）。"""
         with self.lock:
@@ -976,6 +991,7 @@ class RosBridge(Node):
                     'imu':self.imu if now-self.imu_at<2 else None,'imu_history':list(self.imu_history),
                     'lidar':{'state':'online' if now-self.scan_at<2 else 'offline','hz':hz(self.scan_times) if now-self.scan_at<2 else None,'age_s':age(self.scan_at)},
                     'camera':{'state':'online' if now-self.camera_at<3 else 'offline','size':self.camera_size,'fps':hz(self.camera_times) if now-self.camera_at<3 else None,'age_s':age(self.camera_at)},
+                    'commanded':self.commanded if now-self.commanded_at<3 else None,'front_clearance_m':self.front_clearance(),
                     'mission':{**dict(self.mission),'stuck_s':round(self.stuck_s,1)},'mission_trace':list(self.trace)[-8:],'record':{'active':self.record['active'],'count':self.record['count'],'distance_m':self.record['distance_m'],'points':self.record['points']},'speed_mps':self.speed,'battery_voltage':self.battery_voltage if now-self.voltage_at<5 else None,
                     'battery':{'state':'online' if now-self.voltage_at<5 or now-self.bms_at<5 else 'offline','voltage_v':self.battery_voltage if now-self.voltage_at<5 else None,'age_s':age(self.voltage_at),'percentage':self.bms['percentage'] if self.bms and now-self.bms_at<5 else None,'charging':self.charging if now-self.charging_at<5 else None,'charging_current_a':self.charging_current if now-self.current_at<5 else None,'bms':self.bms if now-self.bms_at<5 else None},
                     'chassis':{'state':'online' if now-self.raw_odom_at<2 else 'offline','model':'mini_akm','drive_type':'ackermann','age_s':age(self.raw_odom_at),'odometry':self.raw_odom if now-self.raw_odom_at<2 else None,'commanded_velocity':self.commanded if now-self.commanded_at<2 else None,'command_age_s':age(self.commanded_at)},'error':self.error}

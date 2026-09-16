@@ -44,5 +44,13 @@
   },
   "cruise_clearance": 0.22,
   "cruise_skip_near_m": 0.25,
-  "cruise_skip_stall_s": 5.0
+  "cruise_skip_stall_s": 5.0,
+  "min_turn_radius": 0.3,
+  "cruise_avoidance": false,
+  "cruise_stuck_s": 8.0,
+  "cruise_stuck_max": 6,
+  "cruise_relocalize": true,
+  "cruise_lookahead_m": 2.5,
+  "cruise_lookahead_max_points": 40,
+  "skip_missed_points": true
 }
