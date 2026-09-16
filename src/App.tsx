@@ -157,7 +157,7 @@ export function App(){
  {running&&<>{s?.mission.stop_reason&&<div className="mission-stop-reason" role="status">已停车：{s.mission.stop_reason}</div>}
  <div className="mission-progress"><span>航点 {(s?.mission.index||0)+1} / {s?.mission.points.length}</span>{!!s?.mission.skipped&&<span>已跳过 {s.mission.skipped} 个点{s?.mission.skip_reason?`（${s.mission.skip_reason}）`:''}</span>}<span>{mode==='loop'?`第 ${(s?.mission.cycle||0)+1} 圈`:fmt(s?.mission.distance_remaining,1)+' m'}</span></div></>}
  {!running&&s?.mission.stop_reason&&<div className="mission-stop-reason" role="status">已停车：{s.mission.stop_reason}</div>}
- {running&&(s?.mission.stuck_s??0)>=3&&<div className="mission-stop-reason" role="status">车已 {Math.round(s!.mission.stuck_s!)} 秒没有前进{s?.mission.skip_reason?`（${s.mission.skip_reason}）`:''}：正在尝试跳过该航点或重新规划</div>}
+ {running&&(s?.mission.stuck_s??0)>=3&&<div className="mission-stop-reason" role="status">车已 {Math.round(s!.mission.stuck_s!)} 秒没有前进{s?.mission.skip_reason?`（${s.mission.skip_reason}）`:''}：目标点就在旁边时会跳过它，否则继续尝试/即将停车</div>}
  </div></Panel></>}
  </aside></main>
  <footer className="statusbar"><div><span className={'connection '+(connected?'online':'')}><i/>{s?.device_id||'小车'}</span><span className="footer-divider"/><span>{tab==='cruise'?(currentMap?.name||'未加载地图'):(s?.mode==='mapping'?'建图中':'待命')}</span></div><div><span className={'platform-state '+(s?.platform.state==='online'?'online':'')}>{s?.platform.state==='online'?<Wifi size={12}/>:<WifiOff size={12}/>}平台{s?.platform.state==='online'?'已连接':s?.platform.state==='unconfigured'?'未配置':'未连接'}</span><span className="footer-divider"/><time>{clock.toLocaleTimeString('zh-CN',{hour12:false})}</time></div></footer>

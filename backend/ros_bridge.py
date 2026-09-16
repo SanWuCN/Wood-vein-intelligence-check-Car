@@ -71,7 +71,7 @@ class RosBridge(Node):
         self.lookahead_m=float(config.get('cruise_lookahead_m',2.5) or 0.)
         self.lookahead_max=int(config.get('cruise_lookahead_max_points',40) or 0)
         self.skip_missed=bool(config.get('skip_missed_points',True))
-        self._skipping=False;self._last_skip_at=0.
+        self._skipping=False;self._last_skip_at=0.;self._target_distance={}
         # “兜圈就跳过”：越过、停在点旁不动、或规划一开头就朝反方向走，都直接去下一个点
         self.skip_near=float(config.get('cruise_skip_near_m',.25))
         self.skip_stall=float(config.get('cruise_skip_stall_s',5.))
@@ -79,6 +79,7 @@ class RosBridge(Node):
         self._stall_ref=None;self._stall_since=None
         # 任务运行中的“车没动”监控：既用于前端提示，也用于卡住时自动跳点
         self.stuck_s=0.;self._move_ref=None;self._move_at=None;self.stuck_skips=0
+        self.trace=deque(maxlen=30)                  # 批次/跳过/结束事件，便于事后定位
         self.stuck_after=float(config.get('cruise_stuck_s',8.))
         self.stuck_max=int(config.get('cruise_stuck_max',6))
         # 相机（ArUco 标签）绝对定位校正：看到已知位置的标签就把车拽回绝对位姿
@@ -613,7 +614,7 @@ class RosBridge(Node):
         with self.lock:
             if self.mission['state'] in ('running','accepting','pausing','paused','stopping'):raise ConsoleError('MISSION_ACTIVE','已有巡航任务')
             if not self.localized():raise ConsoleError('NOT_LOCALIZED','请先完成定位')
-            if not self.nav.server_is_ready():raise ConsoleError('NAV_NOT_READY','导航服务未就绪')
+            if not self.nav_stack_up():raise ConsoleError('NAV_NOT_READY','导航服务未就绪')
             # 先让位再校验（校验会因起点落在障碍/未知区而拒绝）
             if start_conflict(self.map_meta,self.grid,self.pose,self.active_clearance()):
                 await self.nudge_clear_of_obstacles()
@@ -622,10 +623,16 @@ class RosBridge(Node):
                         f'已尝试倒车让位但车仍离障碍不足 {self.active_clearance():g} m，请手动挪车后再开始巡航',409)
             points=validate_waypoints(points,self.map_meta,self.grid,mode)
             self.navigation_goals=automatic_goals(points,self.pose,mode)
-            self.route_cursor=0
+            # 循环路线从离车最近的航点开始（否则一开跑就横穿全场去 1 号点）；
+            # 线性路线仍从第 1 个点开始，保持“按顺序走完”的语义。
+            if mode=='loop' and points and self.pose:
+                self.route_cursor=min(range(len(points)),
+                                      key=lambda i:math.hypot(points[i]['x']-self.pose['x'],points[i]['y']-self.pose['y']))
+            else:
+                self.route_cursor=0
             self.epoch+=1
             self.mission={'state':'accepting','index':0,'cycle':0,'points':points,'mode':mode,'distance_remaining':None,'skipped':0,'skip_reason':None,'abort_reason':None,'stop_reason':None}
-            self.error=None;self.publish_speed();self._send_nav(self.epoch)
+            self.error=None;self.publish_speed();self.mission_trace('start cursor=%d mode=%s'%(self.route_cursor,mode));self._send_nav(self.epoch)
             return dict(self.mission)
 
     def _batch_goals(self,start):
@@ -669,6 +676,15 @@ class RosBridge(Node):
             handle.get_result_async().add_done_callback(lambda f:self._finished(f,ticket))
         f.add_done_callback(accepted)
 
+    def mission_trace(self,event):
+        with self.lock:
+            self.trace.append({'t':round(time.time()%10000,1),'event':event,
+                               'cursor':self.route_cursor,'idx':self.route_cursor%max(1,len(self.navigation_goals)) if self.navigation_goals else 0,
+                               'skipped':self.mission.get('skipped'),'stuck':round(self.stuck_s,1)})
+            if len(self.trace)>30:self.trace.popleft()
+        try:self.get_logger().info(f'[mission] {event} cursor={self.route_cursor}')
+        except Exception:pass
+
     def stuck_tick(self):
         """车是不是停在原地不动（任务运行中）：供前端显示原因，并在超过阈值时自动跳点。"""
         now=time.time()
@@ -679,9 +695,34 @@ class RosBridge(Node):
         if not pose:
             self.stuck_s=0.;return
         if self._move_ref is None or math.hypot(pose['x']-self._move_ref[0],pose['y']-self._move_ref[1])>.03:
-            self._move_ref=(pose['x'],pose['y']);self._move_at=now;self.stuck_s=0.;return
+            self._move_ref=(pose['x'],pose['y']);self._move_at=now;self.stuck_s=0.
+            self.stuck_skips=max(0,self.stuck_skips-1)      # 有前进就抵消一次跳过额度
+            return
         self.stuck_s=now-(self._move_at or now)
         if self.stuck_s<self.stuck_after or self._skipping:return
+        # 只有“目标就在旁边却迟迟到不了”才跳过它（例如该点落在禁区里）。
+        # 若车离目标还很远却完全不动，说明是整体性问题（被挡住/控制器算不过来），
+        # 这时跳点只会把游标推着往前跑、最后绕回起点，反而更糟——所以不跳，只报原因。
+        with self.lock:
+            goals=self.navigation_goals;n=len(goals)
+            loop=self.mission['mode']=='loop'
+            target=goals[(self.route_cursor%n)] if (loop and n) else (goals[min(self.route_cursor,n-1)] if n else None)
+            pose=self.pose
+        near=bool(target and pose and math.hypot(pose['x']-target['x'],pose['y']-target['y'])<=max(self.skip_near,.45))
+        if not near:
+            if self.stuck_s>self.stuck_after*3:
+                with self.lock:
+                    self.mission['state']='failed';self.mission['abort_reason']='stuck'
+                    self.mission['stop_reason']=(f'车连续 {int(self.stuck_s)} s 完全没有前进（离当前航点还有 '
+                                                 f"{math.hypot(pose['x']-target['x'],pose['y']-target['y']):.1f} m）："
+                                                 '多为被障碍挡住、路径不可行或控制器算不过来；已停车')
+                    self.error='已停车：'+self.mission['stop_reason']
+                    handle=self.goal_handle;self.goal_handle=None
+                try:
+                    if handle:handle.cancel_goal_async()
+                    for _ in range(5):self.stop_pub.publish(Twist())
+                except Exception:pass
+            return
         if self.stuck_skips>=self.stuck_max:
             with self.lock:
                 self.mission['state']='failed'
@@ -699,6 +740,7 @@ class RosBridge(Node):
         with self.lock:
             self._skipping=True;self._last_skip_at=now;self.stuck_skips+=1
             self.mission['skip_reason']='卡住不动，已跳过'
+            self.mission_trace('skip:stuck')
             self._move_ref=None;self._move_at=now;self.stuck_s=0.
             handle=self.goal_handle
         try:handle.cancel_goal_async()
@@ -734,7 +776,13 @@ class RosBridge(Node):
             stalled=stalled_here(self._stall_ref,{'x':pose['x'],'y':pose['y'],'speed':speed},
                                  time.time()-(self._stall_since or time.time()),self.skip_stall)
             reason=None
-            if missed_waypoint(pose,target,direction,max(self.arrival_radius*.5,.10)):reason='越过'
+            # “越过”判据收紧：不仅要越过横截面 0.35 m，还必须确实在远离该点
+            # （否则在循环路线上贴着点旁经过会连跳，把游标一路推回起点）
+            if missed_waypoint(pose,target,direction,.35):
+                prev_key=(index,)
+                was=self._target_distance.get(prev_key)
+                self._target_distance={prev_key:distance}
+                if was is None or distance>was+.02:reason='越过'
             elif stalled and distance<=self.skip_near:reason='停在点旁到不了'
             if not reason:return
             self._skipping=True;self._last_skip_at=time.time()
@@ -822,6 +870,7 @@ class RosBridge(Node):
             if m['mode']=='loop':
                 m['cycle']=lap_number(self.route_cursor,n)
                 m['index']=self._waypoint_index()
+                self.mission_trace('batch ok -> cursor=%d'%self.route_cursor)
                 self._send_nav(ticket)
             elif self.route_cursor>=n:
                 self.route_cursor=n;m['index']=max(0,n-1)
@@ -908,7 +957,7 @@ class RosBridge(Node):
         with self.lock:
             if self.mission['state']!='paused':raise ConsoleError('NOT_PAUSED','任务未暂停')
             if not self.localized():raise ConsoleError('NOT_LOCALIZED','定位未就绪')
-            if not self.nav.server_is_ready():raise ConsoleError('NAV_NOT_READY','导航服务未就绪')
+            if not self.nav_stack_up():raise ConsoleError('NAV_NOT_READY','导航服务未就绪')
             self.epoch+=1;self.mission['state']='accepting';self._send_nav(self.epoch)
 
     def snapshot(self):
@@ -927,7 +976,7 @@ class RosBridge(Node):
                     'imu':self.imu if now-self.imu_at<2 else None,'imu_history':list(self.imu_history),
                     'lidar':{'state':'online' if now-self.scan_at<2 else 'offline','hz':hz(self.scan_times) if now-self.scan_at<2 else None,'age_s':age(self.scan_at)},
                     'camera':{'state':'online' if now-self.camera_at<3 else 'offline','size':self.camera_size,'fps':hz(self.camera_times) if now-self.camera_at<3 else None,'age_s':age(self.camera_at)},
-                    'mission':dict(self.mission),'record':{'active':self.record['active'],'count':self.record['count'],'distance_m':self.record['distance_m'],'points':self.record['points']},'speed_mps':self.speed,'battery_voltage':self.battery_voltage if now-self.voltage_at<5 else None,
+                    'mission':{**dict(self.mission),'stuck_s':round(self.stuck_s,1)},'mission_trace':list(self.trace)[-8:],'record':{'active':self.record['active'],'count':self.record['count'],'distance_m':self.record['distance_m'],'points':self.record['points']},'speed_mps':self.speed,'battery_voltage':self.battery_voltage if now-self.voltage_at<5 else None,
                     'battery':{'state':'online' if now-self.voltage_at<5 or now-self.bms_at<5 else 'offline','voltage_v':self.battery_voltage if now-self.voltage_at<5 else None,'age_s':age(self.voltage_at),'percentage':self.bms['percentage'] if self.bms and now-self.bms_at<5 else None,'charging':self.charging if now-self.charging_at<5 else None,'charging_current_a':self.charging_current if now-self.current_at<5 else None,'bms':self.bms if now-self.bms_at<5 else None},
                     'chassis':{'state':'online' if now-self.raw_odom_at<2 else 'offline','model':'mini_akm','drive_type':'ackermann','age_s':age(self.raw_odom_at),'odometry':self.raw_odom if now-self.raw_odom_at<2 else None,'commanded_velocity':self.commanded if now-self.commanded_at<2 else None,'command_age_s':age(self.commanded_at)},'error':self.error}
 
