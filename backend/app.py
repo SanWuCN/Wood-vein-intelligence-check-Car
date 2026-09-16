@@ -398,21 +398,28 @@ class Console:
                 if self.simulate: continue
                 chassis=(self.bridge.snapshot().get('chassis') or {}).get('state')
                 now=time.monotonic()
-                if chassis=='online':
+                if chassis=='online' or self.transition is not None:
+                    # 切换模式/加载地图期间底盘本来就会重启十几秒，这段时间不归守护管
                     self._chassis_down_since=None;continue
                 self._chassis_down_since=self._chassis_down_since or now
-                ok,reason=chassis_restart_decision(self._chassis_down_since,now,self._chassis_restart_at)
+                ok,reason=chassis_restart_decision(self._chassis_down_since,now,self._chassis_restart_at,
+                                                   down_after_s=25.,cooldown_s=60.)
                 if not ok: continue
-                self._chassis_restart_at=now
-                self.last_error='底盘串口无数据（驱动可能已退出），正在自动重启底盘；请同时检查串口线/USB 与底盘供电'
-                await self.safe_stop()
-                if self.bridge.mode=='navigation' and self.active_map_id:
-                    item,_=self.maps.load(self.active_map_id)
-                    await self.switch_mode('navigation',item)
-                elif self.bridge.mode=='mapping':
-                    await self.switch_mode('mapping')
-                else:
-                    await self.processes.stop_robot();self.processes.start_standby()
+                async with self.command_lock:
+                    # 拿到锁后重新确认：切换过程中或底盘已恢复就不动
+                    if self.transition is not None: continue
+                    if (self.bridge.snapshot().get('chassis') or {}).get('state')=='online':
+                        self._chassis_down_since=None;continue
+                    self._chassis_restart_at=time.monotonic()
+                    self.last_error='底盘串口无数据（驱动可能已退出），正在自动重启底盘；请同时检查串口线/USB 与底盘供电'
+                    await self.safe_stop()
+                    if self.bridge.mode=='navigation' and self.active_map_id:
+                        item,_=self.maps.load(self.active_map_id)
+                        await self.switch_mode('navigation',item)
+                    elif self.bridge.mode=='mapping':
+                        await self.switch_mode('mapping')
+                    else:
+                        await self.processes.stop_robot();self.processes.start_standby()
             except Exception as e:
                 self.last_error=f'底盘自动重启失败：{e}'
 
