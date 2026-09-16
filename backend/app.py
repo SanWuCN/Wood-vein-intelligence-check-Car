@@ -16,7 +16,7 @@ import aiohttp
 from aiohttp import web
 import psutil
 import yaml
-from core import ConsoleError,MAP_SAVE_TOLERANCE,MapStore,finite,grid_diff_ratio,pose_arg,should_backup_map,validate_waypoints,map_image
+from core import ConsoleError,MAP_SAVE_TOLERANCE,MapStore,finite,grid_diff_ratio,infeasible_turn_ratio,path_min_radius,pose_arg,should_backup_map,simplify_path,validate_waypoints,map_image
 from processes import Processes
 from navigation_profile import apply_forward_profile
 from uplink import Uplink
@@ -238,6 +238,12 @@ class Console:
             self.start_auto_localize();return {'ok':True,'state':'localizing'}
         if key==('record','start') or key==('record','stop') or key==('record','clear'):
             return {'ok':True,'record':self.bridge.record_command(action)}
+        if key==('routes','simplify'):
+            raw=body.get('points')
+            if not isinstance(raw,list) or len(raw)<2:raise ConsoleError('NO_RECORD','没有足够的航迹点可以整理',409)
+            epsilon=finite(body.get('epsilon'),'epsilon',.01,1.) if body.get('epsilon') is not None else .12
+            clean=simplify_path([{'x':p.get('x'),'y':p.get('y')} for p in raw],epsilon=epsilon)
+            return {'ok':True,'points':clean,'raw_count':len(raw),'count':len(clean),'min_radius':path_min_radius(clean)}
 
         if key==('navigation','refine'):
             enabled=body.get('enabled')
@@ -264,11 +270,15 @@ class Console:
                 self.auto_task=asyncio.create_task(refine())
             return {'ok':True,'state':'localizing','pose':p,'snap':snap}
         if key==('navigation','preview'):
-            result=await self.bridge.preview(body.get('points'),body.get('mode','multi'));return {'ok':True,**result}
+            result=await self.bridge.preview(body.get('points'),body.get('mode','multi'))
+            return {'ok':True,**result,'min_radius':path_min_radius(body.get('points') or []),
+                    'tight_turn_ratio':round(infeasible_turn_ratio(body.get('points') or []),3)}
         if key==('navigation','start'):
             if body.get('map_id')!=self.active_map_id or not self.active_map_id:raise ConsoleError('MAP_MISMATCH','任务地图与已加载地图不一致')
             speed=finite(body.get('speed_mps'), 'speed_mps',.05,self.config['max_speed_mps']);self.bridge.speed=speed
-            result=self.bridge.start_mission(body.get('points'),body.get('mode','multi'));return {'ok':True,'mission':result}
+            result=self.bridge.start_mission(body.get('points'),body.get('mode','multi'))
+            return {'ok':True,'mission':result,'min_radius':path_min_radius(body.get('points') or []),
+                    'tight_turn_ratio':round(infeasible_turn_ratio(body.get('points') or []),3)}
         if key==('navigation','pause'):
             if self.bridge.mission['state'] not in ('running','accepting'):raise ConsoleError('NOT_RUNNING','巡航未运行')
             await self.safe_stop(pause=True);return {'ok':True,'state':'paused'}

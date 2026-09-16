@@ -481,3 +481,74 @@ def should_backup_map(save_current, saved, diff_ratio, tolerance=MAP_SAVE_TOLERA
     if save_current is True: return True
     if not saved: return True
     return diff_ratio > tolerance
+
+
+MIN_TURN_RADIUS = 0.35
+
+
+def path_turn_radii(points):
+    """相邻三段隐含的转弯半径列表（用于判断路线是否超出车的最小转弯能力）。"""
+    radii = []
+    for i in range(1, len(points) - 1):
+        a = math.atan2(points[i]['y'] - points[i - 1]['y'], points[i]['x'] - points[i - 1]['x'])
+        b = math.atan2(points[i + 1]['y'] - points[i]['y'], points[i + 1]['x'] - points[i]['x'])
+        turn = abs((b - a + math.pi) % (2 * math.pi) - math.pi)
+        length = (math.hypot(points[i]['x'] - points[i - 1]['x'], points[i]['y'] - points[i - 1]['y']) +
+                  math.hypot(points[i + 1]['x'] - points[i]['x'], points[i + 1]['y'] - points[i]['y'])) / 2
+        if turn > 1e-6 and length > 1e-6: radii.append(length / turn)
+    return radii
+
+
+def path_min_radius(points):
+    radii = path_turn_radii(points)
+    return min(radii) if radii else None
+
+
+def infeasible_turn_ratio(points, min_radius=MIN_TURN_RADIUS):
+    """转弯比车的最小转弯半径还紧的比例（0–1）。"""
+    radii = path_turn_radii(points)
+    if not radii: return 0.
+    return sum(1 for r in radii if r < min_radius) / len(radii)
+
+
+def simplify_path(points, epsilon=.12, min_spacing=.25, smooth_passes=2):
+    """把遥控录制的原始轨迹整理成可行驶的航点序列。
+
+    录制按固定位移采样（每 10 cm 一个点），叠加定位抖动后局部曲率会远超车的
+    最小转弯半径（实测 94 点里 27% 的转弯半径 < 0.35 m，最小 0.07 m），
+    规划器无法跟随、只能绕圈。这里先做邻域平滑压掉高频抖动，再用
+    Ramer–Douglas–Peucker 抽稀保形，最后按最小间距去重。"""
+    pts = [{'x': float(p['x']), 'y': float(p['y'])} for p in points]
+    for _ in range(max(0, int(smooth_passes))):
+        if len(pts) < 3: break
+        smoothed = [pts[0]]
+        for i in range(1, len(pts) - 1):
+            smoothed.append({'x': (pts[i - 1]['x'] + 2 * pts[i]['x'] + pts[i + 1]['x']) / 4,
+                             'y': (pts[i - 1]['y'] + 2 * pts[i]['y'] + pts[i + 1]['y']) / 4})
+        smoothed.append(pts[-1]); pts = smoothed
+    if len(pts) > 2 and epsilon > 0: pts = _rdp(pts, epsilon)
+    result = []
+    for p in pts:
+        if result and math.hypot(p['x'] - result[-1]['x'], p['y'] - result[-1]['y']) < min_spacing:
+            continue
+        result.append({'x': round(p['x'], 3), 'y': round(p['y'], 3)})
+    if len(result) < 2: result = pts[:2] if len(pts) >= 2 else pts
+    return result
+
+
+def _rdp(points, epsilon):
+    """Ramer–Douglas–Peucker 抽稀：只保留偏离直线超过 epsilon 的点。"""
+    if len(points) < 3: return list(points)
+    start, end = points[0], points[-1]
+    dx, dy = end['x'] - start['x'], end['y'] - start['y']
+    length = math.hypot(dx, dy)
+    worst, index = -1., 0
+    for i in range(1, len(points) - 1):
+        p = points[i]
+        if length < 1e-9:
+            dist = math.hypot(p['x'] - start['x'], p['y'] - start['y'])
+        else:
+            dist = abs(dy * (p['x'] - start['x']) - dx * (p['y'] - start['y'])) / length
+        if dist > worst: worst, index = dist, i
+    if worst <= epsilon: return [start, end]
+    return _rdp(points[:index + 1], epsilon)[:-1] + _rdp(points[index:], epsilon)

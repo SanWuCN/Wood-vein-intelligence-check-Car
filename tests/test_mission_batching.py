@@ -6,7 +6,8 @@ from pathlib import Path
 import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'backend'))
 from core import (MAP_SAVE_TOLERANCE, ConsoleError, circle_footprint, footprint_center, footprint_points, footprint_text,
-                  grid_diff_ratio, lap_number, missed_waypoint, plan_batch, points_within, should_backup_map,
+                  grid_diff_ratio, infeasible_turn_ratio, lap_number, missed_waypoint, path_min_radius, plan_batch,
+                  points_within, should_backup_map, simplify_path,
                   prune_reached_goals, record_step, remaining_route_distance, start_conflict,
                   validate_waypoints, waypoint_index)
 
@@ -184,3 +185,67 @@ class MapSaveBackupTests(unittest.TestCase):
         after = before.copy(); after[0, :3] = 100                # 3/40000 = 0.0075%
         self.assertLess(grid_diff_ratio(before, after), MAP_SAVE_TOLERANCE)
         self.assertFalse(should_backup_map(None, True, grid_diff_ratio(before, after)))
+
+
+class SimplifyPathTests(unittest.TestCase):
+    """录制轨迹整理：压掉定位抖动，保证转弯不小于车的最小转弯半径。"""
+
+    def jittery(self, count=80, step=.1, noise=.03, radius=1.0):
+        import random
+        rng = random.Random(7)
+        pts = []
+        for i in range(count):
+            a = i * step / radius
+            pts.append({'x': radius * math.sin(a) + rng.uniform(-noise, noise),
+                        'y': radius * (1 - math.cos(a)) + rng.uniform(-noise, noise)})
+        return pts
+
+    def test_jittery_recording_is_tidied(self):
+        raw = self.jittery()
+        self.assertLess(path_min_radius(raw), .35)          # 原始录制确实有不可行的急弯
+        clean = simplify_path(raw, epsilon=.12)
+        self.assertLess(len(clean), len(raw) / 2)           # 明显抽稀
+        self.assertGreaterEqual(path_min_radius(clean), .35)  # 整理后每个转弯都drivable
+        self.assertEqual(infeasible_turn_ratio(clean), 0.)
+
+    def test_straight_route_collapses_to_endpoints(self):
+        raw = [{'x': i * 1.2, 'y': 0.} for i in range(5)]
+        clean = simplify_path(raw, epsilon=.12, min_spacing=.25)
+        self.assertEqual(len(clean), 2)                       # 共线中间点没有信息量
+        self.assertEqual(clean[0], {'x': 0., 'y': 0.})
+
+    def test_every_original_point_stays_within_epsilon(self):
+        raw = self.jittery(count=60, noise=.02, radius=1.5)
+        eps = .15
+        clean = simplify_path(raw, epsilon=eps)
+        for q in raw:
+            # RDP 保形（≤epsilon）+ 前置平滑带来的位移（约 1/4 抖动幅度）
+            self.assertLess(self.polyline_distance(clean, q), eps + .03)
+
+    @staticmethod
+    def polyline_distance(line, point):
+        best = float('inf')
+        for a, b in zip(line, line[1:]):
+            dx, dy = b['x'] - a['x'], b['y'] - a['y']
+            length2 = dx * dx + dy * dy
+            if length2 < 1e-12:
+                d = math.hypot(point['x'] - a['x'], point['y'] - a['y'])
+            else:
+                u = max(0., min(1., ((point['x'] - a['x']) * dx + (point['y'] - a['y']) * dy) / length2))
+                d = math.hypot(point['x'] - (a['x'] + u * dx), point['y'] - (a['y'] + u * dy))
+            best = min(best, d)
+        return best
+
+    def test_duplicate_and_short_inputs_are_safe(self):
+        self.assertEqual(len(simplify_path([{'x': 0., 'y': 0.}, {'x': .05, 'y': 0.}], min_spacing=.25)), 2)
+        self.assertEqual(path_min_radius([{'x': 0., 'y': 0.}]), None)
+        self.assertEqual(infeasible_turn_ratio([]), 0.)
+
+    def test_turn_radius_maths(self):
+        # 半径 1m 的圆弧上等距取点：隐含半径应接近 1m
+        pts = [{'x': math.sin(i * .2), 'y': 1 - math.cos(i * .2)} for i in range(6)]
+        self.assertAlmostEqual(path_min_radius(pts), 1.0, places=2)
+        self.assertEqual(infeasible_turn_ratio(pts), 0.)
+        sharp = [{'x': 0., 'y': 0.}, {'x': .3, 'y': 0.}, {'x': .3, 'y': .3}]   # 90° 直角
+        self.assertLess(path_min_radius(sharp), .35)
+        self.assertGreater(infeasible_turn_ratio(sharp), .9)
