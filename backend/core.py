@@ -483,7 +483,7 @@ def should_backup_map(save_current, saved, diff_ratio, tolerance=MAP_SAVE_TOLERA
     return diff_ratio > tolerance
 
 
-MIN_TURN_RADIUS = 0.35
+MIN_TURN_RADIUS = 0.30      # 实测最小转弯半径
 
 
 def path_turn_radii(points):

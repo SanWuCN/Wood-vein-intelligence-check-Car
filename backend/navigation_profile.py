@@ -30,7 +30,7 @@ def available_mppi_critics():
 _MPPI_CRITICS = None
 
 
-def apply_forward_profile(cfg,root,arrival_radius=.25,clearance=.30):
+def apply_forward_profile(cfg,root,arrival_radius=.20,clearance=.30,min_turn_radius=.30):
     """前向导航配置 + 连续巡航行为树。
 
     arrival_radius 是“算作到达航点”的半径（行为树的经过半径用它；终点停靠容差另取，见下），
@@ -45,6 +45,15 @@ def apply_forward_profile(cfg,root,arrival_radius=.25,clearance=.30):
     arrival_radius=max(.05,min(float(arrival_radius),1.))
     planner['motion_model_for_search']='DUBIN'
     planner['tolerance']=round(max(.05,min(arrival_radius*2/3,.25)),3)
+    # 实测最小转弯半径 0.30 m：规划器与控制器都按它算，才敢走窄一点的弯
+    min_turn=max(.15,min(float(min_turn_radius),1.))
+    # 注意层级：SmacPlannerHybrid 的参数就写在 GridBased 这一层（planner 自身），
+    # 再 setdefault('GridBased') 会新建一层嵌套，值根本落不到规划器上。
+    if 'minimum_turning_radius' in planner or planner.get('motion_model_for_search'):
+        planner['minimum_turning_radius']=round(min_turn,3)
+    follow_cfg=cfg['controller_server']['ros__parameters'].setdefault('FollowPath',{})
+    if follow_cfg.get('AckermannConstraints') is not None or follow_cfg.get('motion_model')=='Ackermann':
+        follow_cfg.setdefault('AckermannConstraints',{})['min_turning_r']=round(min_turn,3)
     controller['vx_min']=0.0
     controller['enforce_path_inversion']=False
     # This installed Humble critic uses forward_preference, not the newer mode enum.

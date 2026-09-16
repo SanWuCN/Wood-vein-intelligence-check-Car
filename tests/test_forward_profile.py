@@ -15,13 +15,16 @@ class ForwardProfileTests(unittest.TestCase):
   self.assertTrue({'ComputePathToPose','FollowPath','Wait','ClearEntireCostmap'}<=tags)
   self.assertFalse(tags&{'BackUp','Spin','DriveOnHeading'})
   checker=cfg['controller_server']['ros__parameters']['goal_checker']
-  self.assertEqual(checker['xy_goal_tolerance'],.25);self.assertGreaterEqual(checker['yaw_goal_tolerance'],3.14159)
+  # 默认到点半径 0.20（实测最小转弯半径 0.30 m）：停靠容差不小于它
+  self.assertEqual(checker['xy_goal_tolerance'],.20);self.assertGreaterEqual(checker['yaw_goal_tolerance'],3.14159)
+  self.assertEqual(cfg['planner_server']['ros__parameters']['GridBased']['minimum_turning_radius'],.30)
+  self.assertEqual(c['AckermannConstraints']['min_turning_r'],.30)
   self.assertFalse(c['GoalAngleCritic']['enabled'])
   # 规划器容差必须小于到点半径，否则路径不会真的经过航点
-  self.assertLessEqual(cfg['planner_server']['ros__parameters']['GridBased']['tolerance'],.25)
+  self.assertLessEqual(cfg['planner_server']['ros__parameters']['GridBased']['tolerance'],.20)
   through=ET.parse(cfg['bt_navigator']['ros__parameters']['default_nav_through_poses_bt_xml'])
   self.assertIsNotNone(through.find('.//ComputePathThroughPoses'))
-  self.assertEqual(through.find('.//RemovePassedGoals').get('radius'),'0.25')
+  self.assertEqual(through.find('.//RemovePassedGoals').get('radius'),'0.2')
   self.assertIn('runtime',cfg['bt_navigator']['ros__parameters']['default_nav_through_poses_bt_xml'])
   self.assertFalse({n.tag for n in through.iter()}&{'BackUp','Spin'})
   prior=copy.deepcopy(cfg);apply_forward_profile(cfg,root);self.assertEqual(cfg,prior)

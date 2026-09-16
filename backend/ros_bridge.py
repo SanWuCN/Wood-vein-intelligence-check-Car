@@ -64,7 +64,7 @@ class RosBridge(Node):
         self.speed=config['default_speed_mps'];self.cv=CvBridge();self._camera_encode_at=0
         # 连续巡航：每批下发的目标点数（0=mult 全部剩余 / loop 一圈减一段）
         self.lookahead=int(config.get('cruise_lookahead',4) or 0)
-        self.arrival_radius=float(config.get('cruise_arrival_radius',.08))
+        self.arrival_radius=float(config.get('cruise_arrival_radius',.20))
         # 密集航点（录制每 10 cm 一个点）：窗口按距离补足，避免每几个点就停一次
         self.lookahead_m=float(config.get('cruise_lookahead_m',2.5) or 0.)
         self.lookahead_max=int(config.get('cruise_lookahead_max_points',40) or 0)
