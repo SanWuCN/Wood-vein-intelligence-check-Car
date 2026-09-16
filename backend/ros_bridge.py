@@ -397,8 +397,14 @@ class RosBridge(Node):
             self.stop_pub.publish(Twist());await asyncio.sleep(.4)
         return max_bursts
 
+    def _publish_stop_now(self,count=3,gap=.06):
+        """同步版停车指令（用于 ROS 定时器回调）：条数少、间隔均匀，避免瞬时突发。"""
+        for i in range(max(1,count)):
+            self.stop_pub.publish(Twist())
+            if i+1<max(1,count):time.sleep(gap)
+
     async def _publish_stop(self,count=3,gap=.06):
-        """发几条零速让底盘停车：条数少、间隔均匀，避免瞬时突发压垮下位机串口。"""
+        """异步版停车指令：条数少、间隔均匀，避免瞬时突发压垮下位机串口。"""
         for i in range(max(1,count)):
             self.stop_pub.publish(Twist())
             if i+1<max(1,count):await asyncio.sleep(gap)
@@ -767,7 +773,7 @@ class RosBridge(Node):
                     handle=self.goal_handle;self.goal_handle=None
                 try:
                     if handle:handle.cancel_goal_async()
-                    for _ in range(5):self.stop_pub.publish(Twist())
+                    self._publish_stop_now()
                 except Exception:pass
             return
         if self.stuck_skips>=self.stuck_max:
@@ -780,7 +786,7 @@ class RosBridge(Node):
                 handle=self.goal_handle;self.goal_handle=None
             try:
                 if handle:handle.cancel_goal_async()
-                await self._publish_stop()
+                self._publish_stop_now()
             except Exception:pass
             return
         # 卡住 → 跳过当前航点继续（比原地等恢复动作快得多）
@@ -862,7 +868,7 @@ class RosBridge(Node):
                 handle=self.goal_handle;self.goal_handle=None;self.pending_goal=None
             try:
                 if handle:handle.cancel_goal_async()
-                await self._publish_stop()
+                self._publish_stop_now()
             except Exception:pass
             self.relocalize_state.update({'reason':'stopped','at':now})
             return
