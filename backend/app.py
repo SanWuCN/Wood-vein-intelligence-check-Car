@@ -533,7 +533,9 @@ class Console:
             self.media=Media(self.config,self.processes,self.bridge,self.root)
             async def start_media():
                 try:
-                    await self.media.initialize()
+                    # 默认把 RViz 一起拉起来（rviz_auto_start）：平台侧的「屏幕画面」
+                    # 就是这路 MJPEG，车上 RViz 不跑，平台只能看到离线。
+                    await self.media.initialize(auto_start=bool(self.config.get('rviz_auto_start',True)))
                     self.tasks.append(asyncio.create_task(self.media.capture_loop()));self.tasks.append(asyncio.create_task(self.media.monitor()))
                     await self.media.reconfigure_rtmp()
                 except Exception as e:self.last_error='RViz: '+str(e)

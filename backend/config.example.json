@@ -6,6 +6,7 @@
   "camera_topic": "/camera/color/image_raw",
   "camera_auto_start": true,
   "rviz_display": ":99",
+  "rviz_auto_start": true,
   "rviz_size": [
     694,
     434

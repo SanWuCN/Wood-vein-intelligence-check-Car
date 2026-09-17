@@ -22,8 +22,13 @@ class Media:
         return bool(self.processes.jobs.get('rviz')) and self.processes.jobs['rviz'].poll() is None
 
     async def set_rviz(self,active):
-        """RViz 常驻会吃掉整整一个核（Jetson 上 load 已接近 8/8），改成按需启停：
-        界面切到 RViz 页才启动，切回地图页就关掉。"""
+        """手动启停 RViz（`POST /api/media/rviz`）。
+
+        默认**不再按需启停**：`rviz_auto_start` 让 RViz 跟着控制台服务一起常开，
+        因为平台侧的「屏幕画面」就是这一路 MJPEG —— 车上 RViz 关着，
+        平台拿到的就是一条 200 但不出帧的空流，页面只能显示离线。
+        之前按需启停是为了省一个核（Jetson 上 load 接近 8/8），要看回那套行为，
+        把 `rviz_auto_start` 置 false 即可（本接口与界面上的开关都不受它影响）。"""
         if active:
             if not self.rviz_active():
                 await self.start_rviz()
@@ -33,19 +38,30 @@ class Media:
         self.rviz_jpeg=None;self.rviz_at=0
         return {'active':False}
 
-    async def initialize(self):
-        """只准备虚拟显示与配置；RViz 本身按需启动（它常驻要吃掉一个核）。"""
+    async def initialize(self,auto_start=None):
+        """准备虚拟显示与配置，并（默认）把 RViz 一起拉起来。
+
+        `auto_start` 为 None 时取配置里的 `rviz_auto_start`（缺省按 true 处理）。
+        幂等：`start_rviz()` 也会调到这里，重复调用不会起第二个 Xvfb。
+        """
+        if auto_start is None:
+            auto_start=self.config.get('rviz_auto_start',True)
         display=self.config['rviz_display'];w,h,cl,ct,cr,cb=self.geometry()
-        self.processes.spawn('xvfb',['Xvfb',display,'-screen','0',f'{w}x{h}x24','-nolisten','tcp','-ac','-nocursor'])
-        await asyncio.sleep(1)
+        existing=self.processes.jobs.get('xvfb')
+        if not existing or existing.poll() is not None:
+            self.processes.spawn('xvfb',['Xvfb',display,'-screen','0',f'{w}x{h}x24','-nolisten','tcp','-ac','-nocursor'])
+            await asyncio.sleep(1)
         # RViz 退出时会回写配置文件，因此每次启动都用一份干净的运行副本。
+        # 常开模式下这一步不能盖掉正在运行的 RViz：先看进程在不在，在就不重写。
+        if self.rviz_active():return
         config_path=self.root/'runtime'/'rviz'/'console.rviz'
         config_path.parent.mkdir(parents=True,exist_ok=True)
         shutil.copyfile(self.root/'deploy'/'console.rviz',config_path)
+        if auto_start:await self.start_rviz()
 
     async def start_rviz(self):
         """启动 RViz 与布局脚本（幂等）。"""
-        await self.initialize()
+        await self.initialize(auto_start=False)
         if self.rviz_active():return
         display=self.config['rviz_display'];w,h,cl,ct,cr,cb=self.geometry()
         config_path=self.root/'runtime'/'rviz'/'console.rviz'
