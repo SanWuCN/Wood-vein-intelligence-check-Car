@@ -7,7 +7,7 @@ import rclpy
 from rclpy.action import ActionServer,ActionClient,CancelResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from nav2_msgs.action import NavigateThroughPoses,ComputePathThroughPoses,FollowPath,Wait
+from nav2_msgs.action import NavigateThroughPoses,ComputePathThroughPoses,FollowPath,Wait,BackUp
 from nav2_msgs.srv import ClearEntireCostmap
 from lifecycle_msgs.srv import ChangeState
 from geometry_msgs.msg import PoseStamped,TransformStamped
@@ -24,7 +24,8 @@ def main():
   else:h.abort()
   return FollowPath.Result()
  def wait(h):h.succeed();return Wait.Result()
- servers=[ActionServer(n,t,name,execute_callback=fn,callback_group=group,cancel_callback=lambda h:CancelResponse.ACCEPT) for t,name,fn in [(ComputePathThroughPoses,'compute_path_through_poses',plan),(FollowPath,'follow_path',follow),(Wait,'wait',wait)]]
+ def backup(h):h.succeed();return BackUp.Result()
+ servers=[ActionServer(n,t,name,execute_callback=fn,callback_group=group,cancel_callback=lambda h:CancelResponse.ACCEPT) for t,name,fn in [(ComputePathThroughPoses,'compute_path_through_poses',plan),(FollowPath,'follow_path',follow),(Wait,'wait',wait),(BackUp,'backup',backup)]]
  services=[n.create_service(ClearEntireCostmap,name,lambda q,r:r,callback_group=group) for name in ['global_costmap/clear_entirely_global_costmap','local_costmap/clear_entirely_local_costmap']]
  tf=TransformBroadcaster(n);odom=n.create_publisher(Odometry,'odom',10)
  def publish():
@@ -51,13 +52,13 @@ def main():
    p=PoseStamped();p.header.frame_id='map';p.header.stamp=n.get_clock().now().to_msg();p.pose.position.x=x;p.pose.position.y=y;p.pose.orientation.w=1.;goal.poses.append(p)
   handle=await_future(nav.send_goal_async(goal,feedback_callback=lambda m:feedback.append(m.feedback.number_of_poses_remaining)));assert handle.accepted
   until(lambda:any(len(p)==3 for p in plans))
-  location[:]=[.65,0.] # 35 cm from first waypoint: accept without hitting center.
+  location[:]=[.80,0.] # Inside the configured 25 cm pass radius.
   until(lambda:2 in feedback and any(len(p)==2 for p in plans))
   location[:]=[1.6,.6] # Outside the previous radius; it must remain removed.
   before=len(plans);until(lambda:len(plans)>before)
   assert all((1.,0.) not in p for p in plans[before:]),'passed point reappeared'
   await_future(handle.cancel_goal_async());await_future(handle.get_result_async())
-  print('PASS: real Nav2 tree loads; planner receives all 3 points; 35 cm proximity removes first; later replanning never restores it; cancellation works. Fake controller only; no cmd_vel or chassis.')
+  print('PASS: real Nav2 tree loads; planner receives all 3 points; 20 cm proximity removes first; later replanning never restores it; cancellation works. Fake controller only; no cmd_vel or chassis.')
  finally:
   closing.set()
   if process.poll() is None:

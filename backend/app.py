@@ -29,8 +29,12 @@ class Console:
         self.root=Path(root);self.simulate=simulate;self.config_path=Path(config_path or self.root/'config.local.json')
         self.config=json.loads((ROOT/'backend/config.example.json').read_text())
         if self.config_path.exists():self.config.update(json.loads(self.config_path.read_text()))
+        # Migrate older local settings to the console's current cruise policy.
+        save_speed_policy=(self.config['max_speed_mps']!=.2 or self.config['default_speed_mps']!=.05)
+        self.config.update(max_speed_mps=.2,default_speed_mps=.05)
         if not self.config['control_token']:
-            self.config['control_token']=secrets.token_urlsafe(32);self.save_config()
+            self.config['control_token']=secrets.token_urlsafe(32);save_speed_policy=True
+        if save_speed_policy:self.save_config()
         if simulate:
             from simulator import SimBridge
             self.bridge=SimBridge(self.config)
@@ -45,6 +49,7 @@ class Console:
         # Normalize legacy saved routes without retaining user-specified headings.
         for route in self.routes:
             route['points']=[{'x':p['x'],'y':p['y']} for p in route.get('points',[])]
+            route['speed_mps']=max(0.,min(route.get('speed_mps',.05),self.config['max_speed_mps']))
         if simulate and not self.maps.list():self.maps.save('实验室地图',*self.bridge.snapshot_map())
         if not simulate:
             existing=self.processes.existing_launches()
@@ -299,7 +304,9 @@ class Console:
                     'tight_turn_ratio':round(infeasible_turn_ratio(body.get('points') or []),3)}
         if key==('navigation','start'):
             if body.get('map_id')!=self.active_map_id or not self.active_map_id:raise ConsoleError('MAP_MISMATCH','任务地图与已加载地图不一致')
-            speed=finite(body.get('speed_mps'), 'speed_mps',.05,self.config['max_speed_mps']);self.bridge.speed=speed
+            speed=finite(body.get('speed_mps'), 'speed_mps',0.,self.config['max_speed_mps'])
+            if speed==0:raise ConsoleError('ZERO_SPEED','巡航速度为 0，请先调高速度',409)
+            self.bridge.speed=speed
             result=await self.bridge.start_mission(body.get('points'),body.get('mode','multi'))
             return {'ok':True,'mission':result,'min_radius':path_min_radius(body.get('points') or []),
                     'tight_turn_ratio':round(infeasible_turn_ratio(body.get('points') or []),3)}
@@ -307,9 +314,19 @@ class Console:
             if self.bridge.mission['state'] not in ('running','accepting'):raise ConsoleError('NOT_RUNNING','巡航未运行')
             await self.safe_stop(pause=True);return {'ok':True,'state':'paused'}
         if key==('navigation','resume'):
+            if self.bridge.mission['state']!='paused':raise ConsoleError('NOT_PAUSED','任务未暂停')
+            speed=finite(body.get('speed_mps',self.bridge.speed),'speed_mps',0.,self.config['max_speed_mps'])
+            if speed==0:raise ConsoleError('ZERO_SPEED','巡航速度为 0，请先调高速度',409)
+            self.bridge.speed=speed;self.bridge.publish_speed()
             self.bridge.resume();return {'ok':True,'state':'accepting'}
         if key==('navigation','speed'):
-            self.bridge.speed=finite(body.get('speed_mps'),'speed_mps',.05,self.config['max_speed_mps']);self.bridge.publish_speed()
+            speed=finite(body.get('speed_mps'),'speed_mps',0.,self.config['max_speed_mps'])
+            self.bridge.speed=speed
+            if speed==0:
+                # Nav2 SpeedLimit(0) removes the limit; cancel motion instead.
+                if self.bridge.mission['state'] in ('running','accepting'):
+                    await self.safe_stop(pause=True)
+            else:self.bridge.publish_speed()
             return {'ok':True,'speed_mps':self.bridge.speed}
         if key==('routes','save'):
             import uuid
@@ -317,7 +334,7 @@ class Console:
             points=validate_waypoints(body.get('points'),item['map'],grid,body.get('mode','multi'))
             name=body.get('name','')
             if not isinstance(name,str) or not 1<=len(name.strip())<=40:raise ConsoleError('INVALID_NAME','路线名称应为 1–40 字',422)
-            route={'id':uuid.uuid4().hex,'name':name.strip(),'map_id':item['id'],'mode':body.get('mode','multi'),'points':points,'speed_mps':finite(body.get('speed_mps'),'speed_mps',.05,self.config['max_speed_mps'])}
+            route={'id':uuid.uuid4().hex,'name':name.strip(),'map_id':item['id'],'mode':body.get('mode','multi'),'points':points,'speed_mps':finite(body.get('speed_mps'),'speed_mps',0.,self.config['max_speed_mps'])}
             self.routes.append(route);self.routes=self.routes[-200:]
             temp=self.routes_path.with_suffix('.tmp');temp.write_text(json.dumps(self.routes,ensure_ascii=False));temp.replace(self.routes_path)
             return {'ok':True,'route':route}
@@ -416,8 +433,10 @@ class Console:
                     # 切换模式/加载地图期间底盘本来就会重启十几秒，这段时间不归守护管
                     self._chassis_down_since=None;continue
                 self._chassis_down_since=self._chassis_down_since or now
+                # 掉线检测从 25 s 缩到 10 s、冷却 60 → 25 s：巡航中掉串口时能更快自愈
+                # （切换模式期间由上面的 transition 判断保护，不会和启动流程抢）
                 ok,reason=chassis_restart_decision(self._chassis_down_since,now,self._chassis_restart_at,
-                                                   down_after_s=25.,cooldown_s=60.)
+                                                   down_after_s=10.,cooldown_s=25.)
                 if not ok: continue
                 async with self.command_lock:
                     # 拿到锁后重新确认：切换过程中或底盘已恢复就不动
@@ -470,7 +489,7 @@ class Console:
                 params=None
                 if mode=='navigation':
                     source=Path(self.config['workspace'])/'install/wheeltec_nav2/share/wheeltec_nav2/param/wheeltec_params/param_mini_akm.yaml'
-                    cfg=apply_forward_profile(yaml.safe_load(source.read_text()),self.root,self.config.get('cruise_arrival_radius',.20),self.config.get('cruise_clearance',.22),self.config.get('min_turn_radius',.30),self.config.get('cruise_avoidance',True));amcl=cfg['amcl']['ros__parameters'];amcl['set_initial_pose']=False
+                    cfg=apply_forward_profile(yaml.safe_load(source.read_text()),self.root,self.config.get('cruise_arrival_radius',.20),self.config.get('cruise_clearance',.22),self.config.get('min_turn_radius',.35),self.config.get('cruise_avoidance',True),self.config.get('cruise_controller','regulated_pure_pursuit'));amcl=cfg['amcl']['ros__parameters'];amcl['set_initial_pose']=False
                     try:
                         local=cfg['local_costmap']['local_costmap']['ros__parameters']
                         self.bridge.footprint_center_cache=footprint_center(local.get('footprint'))

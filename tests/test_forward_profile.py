@@ -9,17 +9,19 @@ class ForwardProfileTests(unittest.TestCase):
   cfg={'planner_server':{'ros__parameters':{'GridBased':{'motion_model_for_search':'REEDS_SHEPP','minimum_turning_radius':.35}}},'controller_server':{'ros__parameters':{'FollowPath':{'vx_min':-.35,'vx_max':.35,'motion_model':'Ackermann'}}},'bt_navigator':{'ros__parameters':{}}}
   apply_forward_profile(cfg,root)
   self.assertEqual(cfg['planner_server']['ros__parameters']['GridBased']['motion_model_for_search'],'DUBIN')
-  c=cfg['controller_server']['ros__parameters']['FollowPath'];self.assertEqual(c['vx_min'],0);self.assertEqual(c['vx_max'],.35)
-  self.assertTrue(c['PathAngleCritic']['forward_preference']);self.assertFalse(c['enforce_path_inversion'])
+  c=cfg['controller_server']['ros__parameters']['FollowPath']
+  self.assertIn('RegulatedPurePursuitController',c['plugin'])
+  self.assertFalse(c['allow_reversing']);self.assertFalse(c['use_rotate_to_heading'])
+  self.assertTrue(c['use_interpolation']);self.assertTrue(c['use_collision_detection'])
   bt=ET.parse(cfg['bt_navigator']['ros__parameters']['default_nav_to_pose_bt_xml']);tags={n.tag for n in bt.iter()}
   self.assertTrue({'ComputePathToPose','FollowPath','Wait','ClearEntireCostmap'}<=tags)
   self.assertFalse(tags&{'Spin','DriveOnHeading'})   # 原地旋转会造成绕圈，倒车恢复是允许的
   checker=cfg['controller_server']['ros__parameters']['goal_checker']
-  # 默认到点半径 0.20（实测最小转弯半径 0.30 m）：停靠容差不小于它
+  # Arrival tolerance is independent of the configured turning radius.
   self.assertEqual(checker['xy_goal_tolerance'],.20);self.assertGreaterEqual(checker['yaw_goal_tolerance'],3.14159)
-  self.assertEqual(cfg['planner_server']['ros__parameters']['GridBased']['minimum_turning_radius'],.30)
-  self.assertEqual(c['AckermannConstraints']['min_turning_r'],.30)
-  self.assertFalse(c['GoalAngleCritic']['enabled'])
+  self.assertEqual(cfg['planner_server']['ros__parameters']['GridBased']['minimum_turning_radius'],.35)
+  self.assertGreaterEqual(c['min_lookahead_dist'],.4)
+  self.assertNotIn('critics',c)
   # 规划器容差必须小于到点半径，否则路径不会真的经过航点
   self.assertLessEqual(cfg['planner_server']['ros__parameters']['GridBased']['tolerance'],.20)
   through=ET.parse(cfg['bt_navigator']['ros__parameters']['default_nav_through_poses_bt_xml'])
@@ -78,15 +80,15 @@ class ForwardProfileTests(unittest.TestCase):
   saved=np._MPPI_CRITICS
   try:
    np._MPPI_CRITICS=set()
-   apply_forward_profile(cfg,root,.08)
+   apply_forward_profile(cfg,root,.08,controller_type='mppi')
    follow=cfg['controller_server']['ros__parameters']['FollowPath']
    self.assertEqual(follow['critics'],['GoalCritic','PathFollowCritic'])
    self.assertNotIn('VelocityDeadbandCritic',follow)
    np._MPPI_CRITICS={'GoalCritic','VelocityDeadbandCritic'};cfg['controller_server']['ros__parameters']['FollowPath']['critics']=['GoalCritic','PathFollowCritic']
-   apply_forward_profile(cfg,root,.08)
+   apply_forward_profile(cfg,root,.08,controller_type='mppi')
    self.assertIn('VelocityDeadbandCritic',follow['critics'])
    self.assertEqual(follow['critics'].count('VelocityDeadbandCritic'),1)
-   apply_forward_profile(cfg,root,.08)
+   apply_forward_profile(cfg,root,.08,controller_type='mppi')
    self.assertEqual(follow['critics'].count('VelocityDeadbandCritic'),1)   # 幂等
   finally:
    np._MPPI_CRITICS=saved
@@ -100,3 +102,15 @@ class ForwardProfileTests(unittest.TestCase):
   import xml.etree.ElementTree as ET
   bt=ET.parse(cfg['bt_navigator']['ros__parameters']['default_nav_through_poses_bt_xml'])
   self.assertEqual(bt.find('.//RemovePassedGoals').get('radius'),'0.35')
+
+ def test_low_speed_progress_and_continuous_odom_frame(self):
+  root=Path(__file__).resolve().parents[1]
+  cfg={'planner_server':{'ros__parameters':{'GridBased':{}}},'controller_server':{'ros__parameters':{'FollowPath':{}}},'bt_navigator':{'ros__parameters':{}},
+       'local_costmap':{'local_costmap':{'ros__parameters':{'global_frame':'map'}}}}
+  apply_forward_profile(cfg,root)
+  cs=cfg['controller_server']['ros__parameters'];progress=cs['progress_checker']
+  self.assertLess(progress['required_movement_radius']/.05,progress['movement_time_allowance']/2)
+  self.assertEqual(cfg['local_costmap']['local_costmap']['ros__parameters']['global_frame'],'odom_combined')
+  self.assertLessEqual(cs['FollowPath']['regulated_linear_scaling_min_speed'],.05)
+  self.assertEqual(cs['FollowPath']['desired_linear_vel'],.05)
+  with self.assertRaises(ValueError):apply_forward_profile(cfg,root,controller_type='typo')

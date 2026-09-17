@@ -1,4 +1,5 @@
 import sys, tempfile, unittest, math, json, asyncio
+from unittest.mock import AsyncMock,patch
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'backend'))
 import numpy as np
@@ -52,9 +53,56 @@ class APITests(unittest.IsolatedAsyncioTestCase):
   self.assertEqual((await self.post('navigation/speed',{'speed_mps':.2},{**self.headers,'Origin':'http://evil.invalid'}))[0],403)
  async def test_rejected_speed_does_not_change(self):
   old=self.console.bridge.speed
-  for v in [0,.36,True,'0.2']:
+  for v in [-.01,.21,.35,True,'0.2']:
    self.assertEqual((await self.post('navigation/speed',{'speed_mps':v}))[0],422)
   self.assertEqual(self.console.bridge.speed,old)
+ async def test_cruise_speed_defaults_and_boundaries(self):
+  self.assertEqual(self.console.bridge.speed,.05)
+  self.assertEqual(self.console.config['max_speed_mps'],.2)
+  for speed in [0,.01,.05,.2]:
+   status,body=await self.post('navigation/speed',{'speed_mps':speed})
+   self.assertEqual(status,200);self.assertEqual(body['speed_mps'],speed)
+   self.assertEqual(self.console.bridge.speed,speed)
+ async def test_zero_speed_pauses_and_positive_speed_does_not_resume(self):
+  b=self.console.bridge;b.mission.update(state='running',points=[{'x':0,'y':0}])
+  with patch.object(b,'publish_speed') as publish:
+   status,_=await self.post('navigation/speed',{'speed_mps':0})
+   self.assertEqual(status,200);self.assertEqual(b.mission['state'],'paused');publish.assert_not_called()
+   status,result=await self.post('navigation/resume',{})
+   self.assertEqual(status,409);self.assertEqual(result['error']['code'],'ZERO_SPEED')
+   self.assertEqual(b.mission['state'],'paused')
+   status,_=await self.post('navigation/speed',{'speed_mps':.01})
+   self.assertEqual(status,200);self.assertEqual(b.mission['state'],'paused');publish.assert_called_once()
+   status,_=await self.post('navigation/resume',{'speed_mps':.05})
+   self.assertEqual(status,200);self.assertEqual(b.speed,.05);self.assertEqual(b.mission['state'],'running')
+ async def test_zero_speed_cancellation_failure_is_not_success(self):
+  b=self.console.bridge;b.mission['state']='running'
+  with patch.object(b,'stop',AsyncMock(side_effect=ConsoleError('CANCEL_UNCONFIRMED','failed'))),patch.object(b,'publish_speed') as publish:
+   status,_=await self.post('navigation/speed',{'speed_mps':0})
+   self.assertEqual(status,503);self.assertEqual(b.mission['state'],'failed');publish.assert_not_called()
+ async def test_zero_speed_never_starts_a_goal(self):
+  b=self.console.bridge;self.console.active_map_id='test'
+  with patch.object(b,'start_mission',AsyncMock()) as start:
+   for speed in [0,-.01,.21]:
+    status,_=await self.post('navigation/start',{'map_id':'test','points':[{'x':0,'y':0}],'speed_mps':speed})
+    self.assertIn(status,(409,422))
+   start.assert_not_called()
+ async def test_routes_enforce_new_speed_range(self):
+  m=self.console.maps.list()[0]
+  for speed,expected in [(0,200),(.01,200),(.2,200),(.21,422)]:
+   status,_=await self.post('routes/save',{'map_id':m['id'],'name':'speed','points':[{'x':0,'y':0}],'mode':'single','speed_mps':speed})
+   self.assertEqual(status,expected)
+ async def test_old_config_and_saved_route_use_new_limits(self):
+  with tempfile.TemporaryDirectory() as d:
+   root=Path(d);(root/'runtime').mkdir()
+   (root/'config.local.json').write_text(json.dumps({'max_speed_mps':.35,'default_speed_mps':.2,'control_token':'existing'}))
+   (root/'runtime/routes.json').write_text(json.dumps([{'points':[],'speed_mps':.35},{'points':[],'speed_mps':0}]))
+   c=Console(root=root,simulate=True)
+   self.assertEqual(c.config['max_speed_mps'],.2);self.assertEqual(c.bridge.speed,.05)
+   self.assertEqual([r['speed_mps'] for r in c.routes],[.2,0])
+   saved=json.loads((root/'config.local.json').read_text())
+   self.assertEqual(saved['max_speed_mps'],.2);self.assertEqual(saved['default_speed_mps'],.05)
+   self.assertEqual(saved['control_token'],'existing')
  async def test_idempotent_save(self):
   h={**self.headers,'X-Request-Id':'unique-save'}
   a=await self.post('mapping/save',{'name':'接口测试'},h);b=await self.post('mapping/save',{'name':'接口测试'},h)

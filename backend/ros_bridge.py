@@ -2,6 +2,7 @@
 import asyncio
 import io
 import math
+import os
 import threading
 import time
 from collections import deque
@@ -22,12 +23,13 @@ from std_msgs.msg import Float32, Bool
 from std_srvs.srv import Empty
 from lifecycle_msgs.srv import GetState
 from lifecycle_msgs.msg import State
+from rcl_interfaces.srv import SetParameters
 from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 from cv_bridge import CvBridge
 import cv2
 from core import (ConsoleError, automatic_goals, bounds, grid_likelihood, idle_refine_decision, lap_number, missed_waypoint,
                   aruco_consistent, aruco_jump_ok, marker_pose_from_robot, plan_leads_away, relocalize_decision,
-                  robot_pose_from_marker, stalled_here,
+                  robot_pose_from_marker, stalled_here, mission_stop_reason, circle_footprint, footprint_text,
                     map_image, plan_batch, points_within, prune_reached_goals, record_step, remaining_route_distance, start_conflict,
                     validate_waypoints, waypoint_index,
                     world_to_cell, snap_pose as core_snap_pose)
@@ -70,7 +72,7 @@ class RosBridge(Node):
         # 密集航点（录制每 10 cm 一个点）：窗口按距离补足，避免每几个点就停一次
         self.lookahead_m=float(config.get('cruise_lookahead_m',2.5) or 0.)
         self.lookahead_max=int(config.get('cruise_lookahead_max_points',40) or 0)
-        self.skip_missed=bool(config.get('skip_missed_points',True))
+        self.skip_missed=bool(config.get('skip_missed_points',False))
         self._skipping=False;self._last_skip_at=0.;self._target_distance={}
         # “兜圈就跳过”：越过、停在点旁不动、或规划一开头就朝反方向走，都直接去下一个点
         self.skip_near=float(config.get('cruise_skip_near_m',.25))
@@ -166,7 +168,19 @@ class RosBridge(Node):
         self.aruco_timer=self.create_timer(.5,self.aruco_tick)
         self.speed_timer=self.create_timer(1.,self.publish_speed)
         self.spin_executor=MultiThreadedExecutor(num_threads=3);self.spin_executor.add_node(self)
-        self.thread=threading.Thread(target=self.spin_executor.spin,daemon=True);self.thread.start()
+        self.thread=threading.Thread(target=self._spin,daemon=True);self.thread.start()
+
+    def _spin(self):
+        try:
+            self.spin_executor.spin()
+        except Exception:
+            import logging
+            logging.exception('ROS executor failed; stopping before supervisor restart')
+            try:self._publish_stop_now()
+            except Exception:pass
+            # systemd kills the whole service cgroup, then starts in idle mode.
+            # Never keep a working HTTP server with a dead ROS receiver.
+            os._exit(1)
 
     def on_voltage(self,msg):
         if math.isfinite(msg.data) and msg.data>0:
@@ -620,7 +634,10 @@ class RosBridge(Node):
                                   'shift_m':shift,'shift_deg':result.get('shift_deg'),'pose':result['pose']})
 
     def publish_speed(self):
-        msg=SpeedLimit();msg.header.stamp=self.get_clock().now().to_msg();msg.percentage=False;msg.speed_limit=self.speed
+        # Zero means NO_SPEED_LIMIT in Nav2; the API pauses the mission at zero.
+        speed=self.speed
+        if speed<=0:return
+        msg=SpeedLimit();msg.header.stamp=self.get_clock().now().to_msg();msg.percentage=False;msg.speed_limit=speed
         self.speed_pub.publish(msg)
 
     async def preview(self,points,mode):
@@ -665,6 +682,7 @@ class RosBridge(Node):
 
     async def start_mission(self,points,mode):
         with self.lock:
+            if self.speed<=0:raise ConsoleError('ZERO_SPEED','巡航速度为 0，请先调高速度')
             if self.mission['state'] in ('running','accepting','pausing','paused','stopping'):raise ConsoleError('MISSION_ACTIVE','已有巡航任务')
             if not self.localized():raise ConsoleError('NOT_LOCALIZED','请先完成定位')
             if not self.nav_stack_up():raise ConsoleError('NAV_NOT_READY','导航服务未就绪')
@@ -705,6 +723,7 @@ class RosBridge(Node):
             return
         req=NavigateThroughPoses.Goal();req.poses=[self.pose_msg(p) for p in route]
         count=len(req.poses)
+        self._batch_end=start+count
         def feedback(msg):
             with self.lock:
                 if ticket!=self.epoch:return
@@ -762,7 +781,7 @@ class RosBridge(Node):
             target=goals[(self.route_cursor%n)] if (loop and n) else (goals[min(self.route_cursor,n-1)] if n else None)
             pose=self.pose
         near=bool(target and pose and math.hypot(pose['x']-target['x'],pose['y']-target['y'])<=max(self.skip_near,.45))
-        if not near:
+        if not near or not self.skip_missed:
             if self.stuck_s>self.stuck_after*3:
                 with self.lock:
                     self.mission['state']='failed';self.mission['abort_reason']='stuck'
@@ -890,6 +909,7 @@ class RosBridge(Node):
         with self.lock:
             if ticket!=self.epoch:return
             self.goal_handle=None
+            self.pending_goal=None
             try:status=f.result().status
             except Exception:status=6
             if status!=4:
@@ -900,6 +920,9 @@ class RosBridge(Node):
                     self.mission['skipped']=self.mission.get('skipped',0)+1
                     self.mission['index']=self._waypoint_index();self.mission['state']='accepting'
                     self._send_nav(self.epoch)
+                    return
+                # A local safety stop already has the more precise failure reason.
+                if self.mission['state']=='failed' and self.mission.get('stop_reason'):
                     return
                 self.mission['state']='failed'
                 with self.lock:
@@ -915,9 +938,8 @@ class RosBridge(Node):
                 return
             self.pending_goal=None
             # 一批可能覆盖多个航点：整批走完才推进游标
-            start=self.route_cursor
-            count=max(1,len(self._batch_goals(start)))
-            self.route_cursor=start+count
+            # Feedback already advances route_cursor within this submitted batch.
+            self.route_cursor=max(self.route_cursor,self._batch_end)
             n=len(self.navigation_goals)
             m=self.mission
             if m['mode']=='loop':
@@ -1008,6 +1030,7 @@ class RosBridge(Node):
 
     def resume(self):
         with self.lock:
+            if self.speed<=0:raise ConsoleError('ZERO_SPEED','巡航速度为 0，请先调高速度')
             if self.mission['state']!='paused':raise ConsoleError('NOT_PAUSED','任务未暂停')
             if not self.localized():raise ConsoleError('NOT_LOCALIZED','定位未就绪')
             if not self.nav_stack_up():raise ConsoleError('NAV_NOT_READY','导航服务未就绪')

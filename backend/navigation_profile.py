@@ -20,7 +20,7 @@ def available_mppi_critics():
                     '/home/wheeltec/wheeltec_ros2/src/**/critics.xml'):
         for path in glob.glob(pattern, recursive=True):
             try:
-                found |= set(_re.findall(r'mppi::critics::([A-Za-z]+Critic)', open(path).read()))
+                found |= set(_re.findall(r'mppi::critics::([A-Za-z]+Critic)', Path(path).read_text()))
             except OSError:
                 continue
     _MPPI_CRITICS = found
@@ -30,7 +30,8 @@ def available_mppi_critics():
 _MPPI_CRITICS = None
 
 
-def apply_forward_profile(cfg,root,arrival_radius=.20,clearance=.22,min_turn_radius=.30,avoidance=True):
+def apply_forward_profile(cfg,root,arrival_radius=.20,clearance=.22,min_turn_radius=.35,avoidance=True,
+                          controller_type='regulated_pure_pursuit'):
     """前向导航配置 + 连续巡航行为树。
 
     arrival_radius 是“算作到达航点”的半径（行为树的经过半径用它；终点停靠容差另取，见下），
@@ -41,12 +42,14 @@ def apply_forward_profile(cfg,root,arrival_radius=.20,clearance=.22,min_turn_rad
     代价地图把该范围内的栅格标成内切/致命，规划器无法进入。它必须小于真实可通行余量，
     否则车（或其估计位置）一旦靠近墙，规划器就会报 "Starting point in lethal space" 直接失败。
     软避让交给膨胀半径（≥0.45 m），让规划器在“很贵但可通行”的代价下优先挑宽敞通道。"""
+    if controller_type not in ('regulated_pure_pursuit','mppi'):
+        raise ValueError('Unsupported cruise controller: '+str(controller_type))
     planner=cfg['planner_server']['ros__parameters']['GridBased']
     controller=cfg['controller_server']['ros__parameters']['FollowPath']
     arrival_radius=max(.05,min(float(arrival_radius),1.))
     planner['motion_model_for_search']='DUBIN'
     planner['tolerance']=round(max(.05,min(arrival_radius*2/3,.25)),3)
-    # 实测最小转弯半径 0.30 m：规划器与控制器都按它算，才敢走窄一点的弯
+    # Configured planning limit; physical turning radius requires vehicle calibration.
     min_turn=max(.15,min(float(min_turn_radius),1.))
     # 注意层级：SmacPlannerHybrid 的参数就写在 GridBased 这一层（planner 自身），
     # 再 setdefault('GridBased') 会新建一层嵌套，值根本落不到规划器上。
@@ -56,6 +59,7 @@ def apply_forward_profile(cfg,root,arrival_radius=.20,clearance=.22,min_turn_rad
     if follow_cfg.get('AckermannConstraints') is not None or follow_cfg.get('motion_model')=='Ackermann':
         follow_cfg.setdefault('AckermannConstraints',{})['min_turning_r']=round(min_turn,3)
     controller['vx_min']=0.0
+    controller['vx_max']=.2
     controller['enforce_path_inversion']=False
     # This installed Humble critic uses forward_preference, not the newer mode enum.
     controller.setdefault('PathAngleCritic',{})['forward_preference']=True
@@ -114,6 +118,7 @@ def apply_forward_profile(cfg,root,arrival_radius=.20,clearance=.22,min_turn_rad
     # "Control loop missed its desired rate of 20.0000Hz"，表现是车走不动/一直在微调。
     # 0.1 m/s 的巡航不需要 20 Hz，也不需要在 2.8 s 外做预测。
     cs=cfg['controller_server']['ros__parameters']
+    cs['goal_checker_plugins']=['goal_checker']
     cs['controller_frequency']=10.0
     controller['time_steps']=26
     controller['model_dt']=0.1
@@ -130,7 +135,41 @@ def apply_forward_profile(cfg,root,arrival_radius=.20,clearance=.22,min_turn_rad
             critics.insert(critics.index('GoalCritic') if 'GoalCritic' in critics else len(critics),'VelocityDeadbandCritic')
             follow['critics']=critics
         follow.setdefault('VelocityDeadbandCritic',{}).update({'enabled':True,'cost_power':1,'cost_weight':1.0,
-                                                               'deadband_velocity':[.05,0.,.2]})
+                                                               'deadband_velocities':[.05,0.,.2]})
+    # At 0.05 m/s, demanding 0.5 m in 10 s leaves no margin for corners.
+    cs.setdefault('progress_checker',{}).update({
+        'plugin':'nav2_controller::SimpleProgressChecker',
+        'required_movement_radius':.10,'movement_time_allowance':15.0})
+    local=_costmap_params(cfg,'local_costmap')
+    if local is not None:
+        # Local tracking must use continuous odometry, not AMCL's map corrections.
+        local['global_frame']='odom_combined'
+        local.setdefault('voxel_layer',{})['publish_voxel_map']=False
+    if controller_type=='regulated_pure_pursuit':
+        cs['controller_frequency']=20.0
+        cs['min_x_velocity_threshold']=.001
+        cs['min_theta_velocity_threshold']=.001
+        cs['FollowPath']={
+            'plugin':'nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController',
+            'desired_linear_vel':.05,
+            'lookahead_dist':.45,'min_lookahead_dist':.40,'max_lookahead_dist':.65,
+            'lookahead_time':2.0,'use_velocity_scaled_lookahead_dist':True,
+            'use_interpolation':True,'transform_tolerance':.2,
+            'use_rotate_to_heading':False,'allow_reversing':False,
+            'min_approach_linear_velocity':.05,'approach_velocity_scaling_dist':.30,
+            'use_regulated_linear_velocity_scaling':True,
+            'regulated_linear_scaling_min_radius':max(.5,min_turn),
+            'regulated_linear_scaling_min_speed':.05,
+            'use_cost_regulated_linear_velocity_scaling':False,
+            'use_collision_detection':True,'max_allowed_time_to_collision_up_to_carrot':1.5,
+            # Bound path pruning so a nearby return leg cannot steal progress.
+            'max_robot_pose_search_dist':1.0,
+        }
+    elif local is not None:
+        inflation=local['inflation_layer']
+        follow.setdefault('ObstaclesCritic',{}).update({
+            'inflation_radius':inflation['inflation_radius'],
+            'cost_scaling_factor':inflation['cost_scaling_factor']})
     return cfg
 
 

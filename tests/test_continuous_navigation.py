@@ -41,7 +41,8 @@ class ContinuousTests(unittest.TestCase):
   b=NS(epoch=2,lock=threading.RLock(),route_cursor=0,pose_msg=pose,goal_handle=None,pending_goal=None,lookahead=lookahead,
        lookahead_m=0.,lookahead_max=0,skip_missed=False,_skipping=False,_last_skip_at=0.,
        mission={'state':'accepting','index':0,'cycle':0,'mode':mode,'points':[{'x':x,'y':y} for x,y in pts]},
-       navigation_goals=goals_of(pts),error=None,nav=NS(send_goal_async=send))
+       navigation_goals=goals_of(pts),error=None,nav=NS(send_goal_async=send),mission_trace=Mock(),
+       map_meta=None,grid=None,pose=None,active_clearance=lambda:.1,plan=[],match=.99)
   b._finished=lambda f,t:RosBridge._finished(b,f,t)
   b._send_nav=lambda t:RosBridge._send_nav(b,t)
   b._batch_goals=lambda s:RosBridge._batch_goals(b,s)
@@ -94,3 +95,11 @@ class ContinuousTests(unittest.TestCase):
  def test_failure_never_advances_or_restarts(self):
   b=self.setup_bridge();b._send_nav(2);self.finish(6)
   self.assertEqual(b.mission['state'],'failed');self.assertEqual(len(self.sent),1)
+ def test_feedback_then_success_does_not_skip_the_next_batch(self):
+  b=self.setup_bridge('multi',lookahead=2,points=[(1,0),(2,0),(3,0),(4,0),(5,0)])
+  b._send_nav(2)
+  self.feedback(NS(feedback=NS(number_of_poses_remaining=1,distance_remaining=.1)))
+  self.assertEqual(b.route_cursor,1)
+  self.finish()
+  self.assertEqual(b.route_cursor,2)
+  self.assertEqual([p.pose.position.x for p in self.sent[-1].poses],[3.,4.])

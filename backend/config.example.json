@@ -12,8 +12,8 @@
     434
   ],
   "video_fps": 8,
-  "max_speed_mps": 0.35,
-  "default_speed_mps": 0.2,
+  "max_speed_mps": 0.2,
+  "default_speed_mps": 0.05,
   "platform_url": "",
   "platform_token": "",
   "rviz_rtmp_url": "",
@@ -33,6 +33,7 @@
   "refine_idle_shift_m": 0.18,
   "refine_idle_yaw_deg": 6,
   "cruise_lookahead": 4,
+  "cruise_controller": "regulated_pure_pursuit",
   "cruise_arrival_radius": 0.2,
   "aruco": {
     "enabled": false,
@@ -46,12 +47,12 @@
   "cruise_clearance": 0.22,
   "cruise_skip_near_m": 0.25,
   "cruise_skip_stall_s": 5.0,
-  "min_turn_radius": 0.3,
+  "min_turn_radius": 0.35,
   "cruise_avoidance": false,
   "cruise_stuck_s": 8.0,
   "cruise_stuck_max": 6,
   "cruise_relocalize": true,
   "cruise_lookahead_m": 2.5,
   "cruise_lookahead_max_points": 40,
-  "skip_missed_points": true
+  "skip_missed_points": false
 }
